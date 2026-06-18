@@ -1172,7 +1172,7 @@ function compareMeta(item) {
   return `
     <strong>Original</strong> : ${item.srcWidth}×${item.srcHeight} · ${inSize} · ${inType}
     &nbsp;→&nbsp;
-    <strong>WebP Studio</strong> : ${item.outWidth}×${item.outHeight}${
+    <strong>Inspire Convert</strong> : ${item.outWidth}×${item.outHeight}${
       resized ? " (redimensionné)" : ""
     } · ${outSize} · ${codecLabel}
     &nbsp;·&nbsp; <strong>${gain >= 0 ? "−" : "+"}${Math.abs(gain)}%</strong>`;
@@ -1641,7 +1641,7 @@ async function downloadZip() {
 
   const link = document.createElement("a");
   link.href = url;
-  link.download = `webp-studio-${ext}-${new Date().toISOString().slice(0, 10)}.zip`;
+  link.download = `inspire-convert-${ext}-${new Date().toISOString().slice(0, 10)}.zip`;
   document.body.append(link);
   link.click();
   link.remove();

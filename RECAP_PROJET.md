@@ -1,6 +1,6 @@
-# Récapitulatif du Projet : WebP Studio (Inspire Conversion)
+# Récapitulatif du Projet : Inspire Convert (Inspire Conversion)
 
-Ce document récapitule les objectifs, les choix techniques, les fonctionnalités implémentées et les perspectives d'évolution du projet **WebP Studio**.
+Ce document récapitule les objectifs, les choix techniques, les fonctionnalités implémentées et les perspectives d'évolution du projet **Inspire Convert**.
 
 ---
 
