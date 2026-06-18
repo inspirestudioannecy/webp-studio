@@ -588,6 +588,13 @@ function addFiles(files) {
   state.items.push(...additions);
   applyGlobalPattern();
   render();
+
+  // Après un ajout (surtout en drag & drop sur écran étroit, où la file passe
+  // sous la zone d'import), on amène la liste à l'écran pour montrer où les
+  // images ont atterri.
+  if (additions.length > 0) {
+    elements.tableWrap?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
 }
 
 function isImageFile(file) {
@@ -1908,9 +1915,23 @@ function renderRows() {
   }
 }
 
-// Vignette légère (~256 px) au lieu de garder l'original pleine résolution en
-// mémoire : indispensable pour rester fluide sur de gros lots. Les HEIC gardent
-// le placeholder (pas de décodage coûteux juste pour un aperçu).
+// Affiche l'aperçu sur la carte (élément vivant, la carte a pu être re-rendue).
+function applyThumbnail(item, url) {
+  item.thumbUrl = url;
+  const liveCard = elements.queueBody.querySelector(`[data-id="${item.id}"]`);
+  if (!liveCard) return;
+  const liveImg = liveCard.querySelector(".card-preview");
+  const livePh = liveCard.querySelector(".card-preview-placeholder");
+  liveImg.src = url;
+  liveImg.style.display = "block";
+  if (livePh) livePh.style.display = "none";
+}
+
+// Aperçu de carte. On tente une vignette légère (~256 px) via createImageBitmap
+// (rapide, peu de mémoire). Si le format n'est pas décodable ainsi (SVG, logos
+// vectoriels…), on retombe sur l'affichage direct du fichier dans <img>, qui
+// gère nativement le SVG. Les HEIC gardent le placeholder (décodage en masse
+// trop coûteux juste pour un aperçu).
 async function ensureThumbnail(item, imgEl, placeholderEl) {
   if (item.thumbUrl) {
     imgEl.src = item.thumbUrl;
@@ -1918,7 +1939,7 @@ async function ensureThumbnail(item, imgEl, placeholderEl) {
     if (placeholderEl) placeholderEl.style.display = "none";
     return;
   }
-  if (item.thumbPending || isHeicFile(item.file)) return;
+  if (item.thumbPending) return;
   item.thumbPending = true;
   try {
     const bitmap = await createImageBitmap(item.file);
@@ -1933,17 +1954,14 @@ async function ensureThumbnail(item, imgEl, placeholderEl) {
     const blob = await new Promise((resolve) =>
       canvas.toBlob(resolve, "image/webp", 0.8),
     );
-    item.thumbUrl = URL.createObjectURL(blob);
-    const liveCard = elements.queueBody.querySelector(`[data-id="${item.id}"]`);
-    if (liveCard) {
-      const liveImg = liveCard.querySelector(".card-preview");
-      const livePh = liveCard.querySelector(".card-preview-placeholder");
-      liveImg.src = item.thumbUrl;
-      liveImg.style.display = "block";
-      if (livePh) livePh.style.display = "none";
-    }
+    applyThumbnail(item, URL.createObjectURL(blob));
   } catch {
-    // format non décodable (HEIC, SVG exotique…) → on garde le placeholder
+    // createImageBitmap ne gère pas ce format : on affiche le fichier tel quel.
+    // Le SVG (et les autres formats lisibles par <img>) s'affiche correctement.
+    if (!isHeicFile(item.file)) {
+      applyThumbnail(item, URL.createObjectURL(item.file));
+    }
+    // HEIC : on garde le placeholder 🖼️ (pas de décodage de masse pour un aperçu).
   } finally {
     item.thumbPending = false;
   }
