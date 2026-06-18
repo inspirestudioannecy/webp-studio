@@ -1,4 +1,28 @@
 import { WorkerPool } from "./worker-pool.js";
+import { computeRegion, targetDimensions, drawResized } from "./image-ops.js";
+
+// Fabrique de canvas DOM pour le chemin de repli (thread principal).
+const createDomCanvas = (w, h) => {
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  return canvas;
+};
+
+// Respecte la préférence système « réduire les animations ».
+const prefersReducedMotion =
+  typeof matchMedia === "function" &&
+  matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+// Petit utilitaire anti-rebond : regroupe les rafales d'événements (frappe au
+// clavier) en un seul appel après `delay` ms d'inactivité.
+function debounce(fn, delay = 120) {
+  let timer = null;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), delay);
+  };
+}
 
 const state = {
   items: [],
@@ -405,8 +429,33 @@ function commitRename(item, raw, inputEl) {
 const renameClient = document.getElementById("renameClient");
 const renamePattern = document.getElementById("renamePattern");
 
-renameClient.addEventListener("input", applyGlobalPattern);
-renamePattern.addEventListener("input", applyGlobalPattern);
+// Restaure la configuration de renommage de la session précédente.
+(() => {
+  try {
+    const savedClient = localStorage.getItem("webp-rename-client");
+    const savedPattern = localStorage.getItem("webp-rename-pattern");
+    if (savedClient != null) renameClient.value = savedClient;
+    if (savedPattern != null && savedPattern.trim()) renamePattern.value = savedPattern;
+  } catch {}
+})();
+
+function saveRenameConfig() {
+  try {
+    localStorage.setItem("webp-rename-client", renameClient.value);
+    localStorage.setItem("webp-rename-pattern", renamePattern.value);
+  } catch {}
+}
+
+// Recalcul des noms anti-rebondi : une rafale de frappe ne relance qu'un seul
+// rendu de la grille au repos (au lieu d'un balayage O(n) par caractère).
+const scheduleGlobalPattern = debounce(applyGlobalPattern, 120);
+
+const onRenameConfigInput = () => {
+  saveRenameConfig();
+  scheduleGlobalPattern();
+};
+renameClient.addEventListener("input", onRenameConfigInput);
+renamePattern.addEventListener("input", onRenameConfigInput);
 
 document.querySelectorAll('input[name="outputFormat"]').forEach((radio) => {
   radio.addEventListener("change", applyGlobalPattern);
@@ -425,7 +474,8 @@ document.querySelectorAll(".rename-tag-btn").forEach((btn) => {
     input.value = text.substring(0, startPos) + variable + text.substring(endPos);
     input.selectionStart = input.selectionEnd = startPos + variable.length;
     input.focus();
-    
+
+    saveRenameConfig();
     applyGlobalPattern();
   });
 });
@@ -554,13 +604,28 @@ function addFiles(files) {
     state.items.map((item) => `${item.relativePath}:${item.file.size}`)
   );
 
-  const additions = files
-    .map((file) => ({
+  let ignoredCount = 0;
+  let duplicateCount = 0;
+  const additions = [];
+
+  for (const file of files) {
+    if (!(isImageFile(file) || isHeicFile(file))) {
+      ignoredCount += 1;
+      continue;
+    }
+    const relativePath = normalizePath(
+      file.relativePath || file.webkitRelativePath || file.name,
+    );
+    const key = `${relativePath}:${file.size}`;
+    if (existing.has(key)) {
+      duplicateCount += 1;
+      continue;
+    }
+    existing.add(key);
+    additions.push({
       id: crypto.randomUUID(),
       file,
-      relativePath: normalizePath(
-        file.relativePath || file.webkitRelativePath || file.name,
-      ),
+      relativePath,
       status: "queued",
       outputName: "",
       outputBlob: null,
@@ -575,14 +640,8 @@ function addFiles(files) {
       sujet: "",
       customNameOverride: false,
       isEditingName: false,
-    }))
-    .filter((item) => isImageFile(item.file) || isHeicFile(item.file))
-    .filter((item) => {
-      const key = `${item.relativePath}:${item.file.size}`;
-      if (existing.has(key)) return false;
-      existing.add(key);
-      return true;
     });
+  }
 
   state.items.push(...additions);
   applyGlobalPattern();
@@ -592,7 +651,20 @@ function addFiles(files) {
   // sous la zone d'import), on amène la liste à l'écran pour montrer où les
   // images ont atterri.
   if (additions.length > 0) {
-    elements.tableWrap?.scrollIntoView({ behavior: "smooth", block: "start" });
+    elements.tableWrap?.scrollIntoView({
+      behavior: prefersReducedMotion ? "auto" : "smooth",
+      block: "start",
+    });
+  }
+
+  // Retour utilisateur : auparavant les fichiers non images / doublons étaient
+  // écartés en silence, sans aucun signe à l'écran.
+  if (ignoredCount > 0 || duplicateCount > 0) {
+    const notes = [];
+    if (additions.length > 0) notes.push(`${additions.length} ajoutée(s)`);
+    if (duplicateCount > 0) notes.push(`${duplicateCount} doublon(s) ignoré(s)`);
+    if (ignoredCount > 0) notes.push(`${ignoredCount} non image(s) ignoré(s)`);
+    showToast(notes.join(" · "), ignoredCount > 0 ? "warn" : "info");
   }
 }
 
@@ -785,6 +857,7 @@ async function convertOnMainThread(blob, settings, crop) {
     region.sh,
     width,
     height,
+    createDomCanvas,
   );
   if (typeof bitmap.close === "function") bitmap.close();
 
@@ -812,92 +885,6 @@ async function convertOnMainThread(blob, settings, crop) {
     codec,
     engine: "canvas",
   };
-}
-
-// Région source à extraire (recadrage manuel explicite ou centré automatique).
-function computeRegion(crop, W, H) {
-  if (!crop) return { sx: 0, sy: 0, sw: W, sh: H };
-
-  if (crop.center && crop.aspect) {
-    const ratio = W / H;
-    let w;
-    let h;
-    if (crop.aspect >= ratio) {
-      w = 1;
-      h = ratio / crop.aspect;
-    } else {
-      h = 1;
-      w = crop.aspect / ratio;
-    }
-    const sw = Math.max(1, Math.round(w * W));
-    const sh = Math.max(1, Math.round(h * H));
-    return { sx: Math.round((W - sw) / 2), sy: Math.round((H - sh) / 2), sw, sh };
-  }
-
-  if (crop.w > 0 && crop.h > 0) {
-    return {
-      sx: Math.round(crop.x * W),
-      sy: Math.round(crop.y * H),
-      sw: Math.max(1, Math.round(crop.w * W)),
-      sh: Math.max(1, Math.round(crop.h * H)),
-    };
-  }
-
-  return { sx: 0, sy: 0, sw: W, sh: H };
-}
-
-function targetDimensions(width, height, settings, crop) {
-  if (crop && crop.outW && crop.outH) {
-    return { width: crop.outW, height: crop.outH };
-  }
-
-  const ratios = [];
-  if (settings.maxWidth) ratios.push(settings.maxWidth / width);
-  if (settings.maxHeight) ratios.push(settings.maxHeight / height);
-
-  let scale = ratios.length ? Math.min(...ratios) : 1;
-  if (settings.noUpscale) scale = Math.min(scale, 1);
-  if (!Number.isFinite(scale) || scale <= 0) scale = 1;
-
-  return {
-    width: Math.max(1, Math.round(width * scale)),
-    height: Math.max(1, Math.round(height * scale)),
-  };
-}
-
-// Réduction par paliers (halving) pour garder de la netteté sur les grosses
-// réductions. La région source (recadrage) est appliquée au premier drawImage.
-function drawResized(source, sx, sy, sw, sh, targetWidth, targetHeight) {
-  let current = source;
-  let currentWidth = sw;
-  let currentHeight = sh;
-  let first = true;
-
-  while (currentWidth > targetWidth * 2 && currentHeight > targetHeight * 2) {
-    const nextWidth = Math.max(targetWidth, Math.floor(currentWidth / 2));
-    const nextHeight = Math.max(targetHeight, Math.floor(currentHeight / 2));
-    current = first
-      ? paintStep(current, sx, sy, sw, sh, nextWidth, nextHeight)
-      : paintStep(current, 0, 0, currentWidth, currentHeight, nextWidth, nextHeight);
-    currentWidth = nextWidth;
-    currentHeight = nextHeight;
-    first = false;
-  }
-
-  return first
-    ? paintStep(current, sx, sy, sw, sh, targetWidth, targetHeight)
-    : paintStep(current, 0, 0, currentWidth, currentHeight, targetWidth, targetHeight);
-}
-
-function paintStep(source, sx, sy, sw, sh, dw, dh) {
-  const canvas = document.createElement("canvas");
-  canvas.width = dw;
-  canvas.height = dh;
-  const context = canvas.getContext("2d", { alpha: true });
-  context.imageSmoothingEnabled = true;
-  context.imageSmoothingQuality = "high";
-  context.drawImage(source, sx, sy, sw, sh, 0, 0, dw, dh);
-  return canvas;
 }
 
 async function loadBitmap(file) {
@@ -1612,6 +1599,11 @@ async function downloadZip() {
   const url = URL.createObjectURL(zipBlob);
   state.zipUrl = url;
 
+  // Mark all successfully zipped items as downloaded
+  state.items.forEach((item) => {
+    if (item.status === "done") item.downloaded = true;
+  });
+
   const settings = readSettings();
   const ext = settings.format === "image/avif" ? "avif" : "webp";
 
@@ -1800,6 +1792,30 @@ function render() {
   renderStats();
 }
 
+// Génération paresseuse des vignettes : on ne décode l'image (coûteux, sur le
+// thread principal) que lorsque la carte approche de l'écran. Déposer un dossier
+// de centaines d'images ne fige donc plus l'UI et n'alloue plus tout d'un coup.
+const thumbObserver =
+  "IntersectionObserver" in window
+    ? new IntersectionObserver(
+        (entries, obs) => {
+          for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+            const card = entry.target;
+            obs.unobserve(card);
+            const item = state.items.find((it) => it.id === card.dataset.id);
+            if (!item) continue;
+            ensureThumbnail(
+              item,
+              card.querySelector(".card-preview"),
+              card.querySelector(".card-preview-placeholder"),
+            );
+          }
+        },
+        { rootMargin: "200px 0px" },
+      )
+    : null;
+
 function renderRows() {
   const existing = new Map(
     Array.from(elements.queueBody.children).map((card) => [
@@ -1869,28 +1885,33 @@ function renderRows() {
           </div>
         </div>
         <div class="card-actions">
-          <button class="action-btn crop-btn" title="Recadrer / format réseaux sociaux">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/></svg>
+          <button class="action-btn convert-single-btn" title="Convertir cette image uniquement" aria-label="Convertir cette image uniquement">
+            <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
           </button>
-          <button class="action-btn cmp-btn" style="display:none;" title="Comparer l'original et le compressé">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+          <button class="action-btn crop-btn" title="Recadrer / format réseaux sociaux" aria-label="Recadrer / format réseaux sociaux">
+            <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/></svg>
+          </button>
+          <button class="action-btn cmp-btn" style="display:none;" title="Comparer l'original et le compressé" aria-label="Comparer l'original et le compressé">
+            <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
             <span>Comparer</span>
           </button>
-          <a class="action-btn dl-btn" style="display:none;" title="Télécharger cette image">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+          <a class="action-btn dl-btn" style="display:none;" title="Télécharger cette image" aria-label="Télécharger cette image">
+            <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
           </a>
-          <button class="action-btn del-btn" title="Retirer de la liste">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          <button class="action-btn del-btn" title="Retirer de la liste" aria-label="Retirer de la liste">
+            <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
           </button>
         </div>
       `;
       elements.queueBody.append(card);
+      if (thumbObserver) thumbObserver.observe(card);
     }
     renderRow(item);
     existing.delete(item.id);
   }
 
   for (const card of existing.values()) {
+    if (thumbObserver) thumbObserver.unobserve(card);
     card.remove();
   }
 }
@@ -1947,9 +1968,98 @@ async function ensureThumbnail(item, imgEl, placeholderEl) {
   }
 }
 
+/* ---------- délégation d'événements des cartes ---------- */
+// Un seul jeu d'écouteurs sur le conteneur, au lieu de (ré)attacher des
+// gestionnaires à chaque bouton à chaque rendu de carte. renderRow ne fait
+// plus que mettre à jour l'état visuel.
+
+function cardItemFromEvent(event) {
+  const card = event.target.closest(".image-card");
+  if (!card) return null;
+  return state.items.find((it) => it.id === card.dataset.id) || null;
+}
+
+async function convertSingleItem(item) {
+  if (state.isConverting || item.status !== "queued") return;
+  state.isConverting = true;
+  render();
+  await convertItem(item, readSettings());
+  state.isConverting = false;
+  render();
+}
+
+function startEditName(item) {
+  item.isEditingName = true;
+  renderRow(item);
+}
+
+function saveEditName(item) {
+  const card = elements.queueBody.querySelector(`[data-id="${item.id}"]`);
+  const input = card && card.querySelector(".card-name-input");
+  if (input) commitRename(item, input.value, input);
+  item.isEditingName = false;
+  renderRow(item);
+}
+
+function resetNameToAuto(item) {
+  item.customNameOverride = false;
+  item.isEditingName = false;
+  updateOutputNameFromPattern(item);
+  enforceUniqueNames();
+  applyGlobalPattern();
+}
+
+elements.queueBody.addEventListener("click", (event) => {
+  const item = cardItemFromEvent(event);
+  if (!item) return;
+  if (event.target.closest(".del-btn")) { removeFile(item.id); return; }
+  if (event.target.closest(".card-retry-btn")) { retryItem(item); return; }
+  if (event.target.closest(".crop-btn")) { openCrop(item); return; }
+  if (event.target.closest(".cmp-btn")) { openCompare(item); return; }
+  if (event.target.closest(".convert-single-btn")) { convertSingleItem(item); return; }
+  if (event.target.closest(".card-edit-btn")) { startEditName(item); return; }
+  if (event.target.closest(".card-rename-ok-btn")) { saveEditName(item); return; }
+  if (event.target.closest(".card-rename-reset-btn")) { resetNameToAuto(item); return; }
+  if (event.target.closest(".dl-btn")) {
+    // L'ancre télécharge nativement ; on marque seulement l'état « téléchargé ».
+    item.downloaded = true;
+    renderRow(item);
+  }
+});
+
+elements.queueBody.addEventListener("dblclick", (event) => {
+  if (!event.target.closest(".card-final-name-wrap")) return;
+  const item = cardItemFromEvent(event);
+  if (item) startEditName(item);
+});
+
+elements.queueBody.addEventListener("keydown", (event) => {
+  if (!event.target.classList?.contains("card-name-input")) return;
+  const item = cardItemFromEvent(event);
+  if (!item) return;
+  if (event.key === "Enter") {
+    event.preventDefault();
+    saveEditName(item);
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    item.isEditingName = false;
+    renderRow(item);
+  }
+});
+
+elements.queueBody.addEventListener("input", (event) => {
+  if (!event.target.classList?.contains("card-sujet-input")) return;
+  const item = cardItemFromEvent(event);
+  if (!item) return;
+  item.sujet = event.target.value;
+  scheduleGlobalPattern();
+});
+
 function renderRow(item) {
   const card = elements.queueBody.querySelector(`[data-id="${item.id}"]`);
   if (!card) return;
+
+  card.className = `image-card status-${item.status}${item.downloaded ? " is-downloaded" : ""}`;
 
   const nameEl = card.querySelector(".card-name");
   nameEl.textContent = `Origine: ${item.relativePath}`;
@@ -1963,7 +2073,9 @@ function renderRow(item) {
 
   const imgEl = card.querySelector(".card-preview");
   const placeholderEl = card.querySelector(".card-preview-placeholder");
-  if (!imgEl.src) {
+  // Vignette : déjà en cache (ou pas d'observer) → affichage immédiat ; sinon
+  // l'IntersectionObserver la générera à l'approche de l'écran.
+  if (!imgEl.src && (item.thumbUrl || !thumbObserver)) {
     ensureThumbnail(item, imgEl, placeholderEl);
   }
 
@@ -1974,22 +2086,36 @@ function renderRow(item) {
     statusEl.title = item.error;
   }
 
-  // Erreur visible + bouton réessayer
+  // Erreur visible + bouton réessayer (clic géré par délégation)
   const errorEl = card.querySelector(".card-error");
   if (item.status === "error" && item.error) {
     errorEl.classList.add("visible");
     card.querySelector(".card-error-msg").textContent = item.error;
-    const retryBtn = card.querySelector(".card-retry-btn");
-    retryBtn.onclick = () => retryItem(item);
   } else {
     errorEl.classList.remove("visible");
   }
 
-  // Bouton recadrer (toujours disponible) + repère « recadré »
+  // Bouton de conversion individuelle (clic géré par délégation)
+  const convertSingleBtn = card.querySelector(".convert-single-btn");
+  if (convertSingleBtn) {
+    if (item.status === "queued") {
+      convertSingleBtn.style.display = "inline-flex";
+      convertSingleBtn.disabled = state.isConverting;
+      convertSingleBtn.innerHTML = `<svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>`;
+    } else if (item.status === "running") {
+      convertSingleBtn.style.display = "inline-flex";
+      convertSingleBtn.disabled = true;
+      convertSingleBtn.innerHTML = `<svg class="spin-icon" aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10" stroke="rgba(0,0,0,0.2)"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor"/></svg>`;
+    } else {
+      convertSingleBtn.style.display = "none";
+    }
+  }
+
+  // Bouton recadrer + repère « recadré » (clic géré par délégation)
   const cropBtn = card.querySelector(".crop-btn");
-  cropBtn.onclick = () => openCrop(item);
   cropBtn.classList.toggle("active", !!item.crop);
   cropBtn.title = item.crop ? "Recadrage actif — modifier" : "Recadrer / format réseaux sociaux";
+  cropBtn.setAttribute("aria-label", cropBtn.title);
 
   const codecEl = card.querySelector(".card-codec-badge");
   if (item.codec) {
@@ -2013,9 +2139,6 @@ function renderRow(item) {
   const finalNameRow = card.querySelector(".card-final-name-row");
   const editInputGroup = card.querySelector(".card-edit-input-group");
   const nameInput = card.querySelector(".card-name-input");
-  const editBtn = card.querySelector(".card-edit-btn");
-  const finalNameWrap = card.querySelector(".card-final-name-wrap");
-  const okBtn = card.querySelector(".card-rename-ok-btn");
   const resetBtn = card.querySelector(".card-rename-reset-btn");
   const modeBadge = card.querySelector(".card-rename-mode-badge");
 
@@ -2034,96 +2157,29 @@ function renderRow(item) {
     if (editInputGroup) editInputGroup.style.display = "none";
   }
 
-  const startEdit = () => {
-    item.isEditingName = true;
-    renderRow(item);
-  };
-  
-  if (editBtn) editBtn.onclick = (e) => { e.stopPropagation(); startEdit(); };
-  if (finalNameWrap) finalNameWrap.ondblclick = startEdit;
-
-  const saveEdit = () => {
-    if (nameInput) {
-      commitRename(item, nameInput.value, nameInput);
-    }
-    item.isEditingName = false;
-    renderRow(item);
-  };
-
-  if (okBtn) okBtn.onclick = (e) => { e.stopPropagation(); saveEdit(); };
-  if (nameInput) {
-    nameInput.onkeydown = (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        saveEdit();
-      } else if (e.key === "Escape") {
-        e.preventDefault();
-        item.isEditingName = false;
-        renderRow(item);
-      }
-    };
-  }
-
   if (item.customNameOverride) {
     if (modeBadge) {
       modeBadge.textContent = "Manuel";
       modeBadge.className = "card-rename-mode-badge manual";
     }
-    if (resetBtn) {
-      resetBtn.style.display = "grid";
-      resetBtn.onclick = (e) => {
-        e.stopPropagation();
-        item.customNameOverride = false;
-        item.isEditingName = false;
-        updateOutputNameFromPattern(item);
-        enforceUniqueNames();
-        applyGlobalPattern();
-      };
-    }
+    if (resetBtn) resetBtn.style.display = "grid";
   } else {
     if (modeBadge) {
       modeBadge.textContent = "Auto";
       modeBadge.className = "card-rename-mode-badge auto";
     }
-    if (resetBtn) {
-      resetBtn.style.display = "none";
-    }
+    if (resetBtn) resetBtn.style.display = "none";
   }
 
-  // Handle conditional display of sujet-group based on pattern containing {sujet}
+  // Sujet : visible seulement si la trame contient {sujet} (saisie déléguée)
   const patternInput = document.getElementById("renamePattern");
   const pattern = patternInput ? patternInput.value : "";
   const hasSujet = pattern.includes("{sujet}");
   const sujetGroup = card.querySelector(".card-sujet-group");
   const sujetInput = card.querySelector(".card-sujet-input");
-
-  if (sujetGroup) {
-    sujetGroup.style.display = hasSujet ? "block" : "none";
-  }
-
-  if (sujetInput) {
-    if (document.activeElement !== sujetInput) sujetInput.value = item.sujet || "";
-    sujetInput.oninput = () => {
-      item.sujet = sujetInput.value;
-      updateOutputNameFromPattern(item);
-      enforceUniqueNames();
-      
-      // Update outputName value on all cards to reflect index and deduplication changes
-      state.items.forEach(other => {
-        const otherCard = elements.queueBody.querySelector(`[data-id="${other.id}"]`);
-        if (otherCard) {
-          const otherFinalName = otherCard.querySelector(".card-final-name");
-          if (otherFinalName && !other.isEditingName) {
-            otherFinalName.textContent = other.outputName;
-          }
-          const otherBadge = otherCard.querySelector(".card-rename-mode-badge");
-          if (otherBadge) {
-            otherBadge.textContent = other.customNameOverride ? "Manuel" : "Auto";
-            otherBadge.className = `card-rename-mode-badge ${other.customNameOverride ? "manual" : "auto"}`;
-          }
-        }
-      });
-    };
+  if (sujetGroup) sujetGroup.style.display = hasSujet ? "block" : "none";
+  if (sujetInput && document.activeElement !== sujetInput) {
+    sujetInput.value = item.sujet || "";
   }
 
   if (item.outputBlob) {
@@ -2137,11 +2193,22 @@ function renderRow(item) {
     gainEl.style.display = "inline-flex";
 
     cmpBtn.style.display = "inline-flex";
-    cmpBtn.onclick = () => openCompare(item);
 
     dlBtn.style.display = "inline-flex";
     dlBtn.href = item.outputUrl;
     dlBtn.download = item.outputName;
+
+    if (item.downloaded) {
+      dlBtn.classList.add("downloaded");
+      dlBtn.title = "Téléchargé (cliquer pour télécharger de nouveau)";
+      dlBtn.setAttribute("aria-label", dlBtn.title);
+      dlBtn.innerHTML = `<svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>`;
+    } else {
+      dlBtn.classList.remove("downloaded");
+      dlBtn.title = "Télécharger cette image";
+      dlBtn.setAttribute("aria-label", dlBtn.title);
+      dlBtn.innerHTML = `<svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>`;
+    }
   } else {
     sizeAfterEl.style.display = "none";
     arrowEl.style.display = "none";
@@ -2149,9 +2216,6 @@ function renderRow(item) {
     cmpBtn.style.display = "none";
     dlBtn.style.display = "none";
   }
-
-  const delBtn = card.querySelector(".del-btn");
-  delBtn.onclick = () => removeFile(item.id);
 }
 
 function renderStats() {
@@ -2193,6 +2257,7 @@ function renderProgress() {
   const percent = Math.round((processed / total) * 100);
   elements.progressWrap.hidden = false;
   elements.progressBar.style.width = `${percent}%`;
+  elements.progressBar.setAttribute("aria-valuenow", String(percent));
   elements.progressLabel.textContent = `${processed}/${total} · ${percent} %`;
 }
 
@@ -2228,5 +2293,71 @@ function formatBytes(bytes) {
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
 }
+
+// Notification éphémère en bas d'écran (status non bloquant).
+let toastTimer = null;
+function showToast(message, type = "info") {
+  let el = document.getElementById("toast");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "toast";
+    el.setAttribute("role", "status");
+    el.setAttribute("aria-live", "polite");
+    document.body.appendChild(el);
+  }
+  el.textContent = message;
+  el.className = `toast toast-${type} show`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("show"), 4000);
+}
+
+/* ---------- accessibilité & retours ---------- */
+
+// Piège de focus : garde la tabulation à l'intérieur de la modale ouverte.
+function activeModal() {
+  if (compare.open) return elements.compareModal;
+  if (cropState.open) return cropEls.modal;
+  return null;
+}
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Tab") return;
+  const modal = activeModal();
+  if (!modal) return;
+  const focusables = Array.from(
+    modal.querySelectorAll(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    ),
+  ).filter((el) => !el.disabled && el.offsetParent !== null);
+  if (focusables.length === 0) return;
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+});
+
+// Zone de dépôt actionnable au clavier (c'est un <div role="button">).
+elements.dropZone.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    elements.fileInput.click();
+  }
+});
+
+// Avertissement de lenteur AVIF (encodage WASM nettement plus lent que WebP).
+const avifHint = document.getElementById("avifHint");
+function updateAvifHint() {
+  if (!avifHint) return;
+  const fmt = document.querySelector('input[name="outputFormat"]:checked');
+  avifHint.hidden = !(fmt && fmt.value === "image/avif");
+}
+document.querySelectorAll('input[name="outputFormat"]').forEach((radio) => {
+  radio.addEventListener("change", updateAvifHint);
+});
+updateAvifHint();
 
 render();

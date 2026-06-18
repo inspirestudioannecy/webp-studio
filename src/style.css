@@ -111,7 +111,7 @@ select:focus-visible {
 .shell {
   width: min(1300px, calc(100vw - 32px));
   margin: 0 auto;
-  padding: 40px 0 60px;
+  padding: 16px 0 32px;
 }
 
 .topbar {
@@ -119,13 +119,19 @@ select:focus-visible {
   align-items: center;
   justify-content: space-between;
   gap: 20px;
-  margin-bottom: 32px;
+  margin-bottom: 16px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 16px;
 }
 
 .title {
   margin: 0;
   font-family: 'Outfit', sans-serif;
-  font-size: clamp(2rem, 4vw, 3rem);
+  font-size: 1.8rem;
   font-weight: 800;
   letter-spacing: -0.03em;
   background: linear-gradient(135deg, var(--ink) 30%, var(--accent) 100%);
@@ -134,11 +140,7 @@ select:focus-visible {
 }
 
 .subtitle {
-  max-width: 650px;
-  margin: 8px 0 0;
-  color: var(--muted);
-  font-size: 0.95rem;
-  line-height: 1.6;
+  display: none;
 }
 
 .topbar-actions {
@@ -314,14 +316,13 @@ select:focus-visible {
 /* ---- Settings ---- */
 .settings {
   display: grid;
-  gap: 20px;
-  padding: 20px;
-  border-top: 1px solid var(--line);
+  gap: 14px;
+  padding: 16px;
 }
 
 .setting-item {
   display: grid;
-  gap: 8px;
+  gap: 6px;
 }
 
 .setting-head {
@@ -391,7 +392,7 @@ input[type="range"] {
 .format-select-group {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 8px;
+  gap: 6px;
   background: var(--input-bg);
   border: 1px solid var(--btn-sec-border);
   border-radius: 8px;
@@ -401,14 +402,16 @@ input[type="range"] {
 .format-radio {
   cursor: pointer;
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   align-items: center;
   justify-content: center;
-  padding: 8px;
+  gap: 6px;
+  padding: 6px 12px;
   border-radius: 6px;
   text-align: center;
-  transition: all 0.2s ease;
+  transition: all 0.15s ease;
   position: relative;
+  color: var(--muted);
 }
 
 .format-radio input {
@@ -420,14 +423,11 @@ input[type="range"] {
 
 .format-radio span {
   font-weight: 700;
-  font-size: 0.95rem;
+  font-size: 0.75rem;
 }
 
 .format-radio .avif-support-badge {
-  font-size: 0.65rem;
-  margin-top: 2px;
-  font-weight: 500;
-  opacity: 0.8;
+  display: none;
 }
 
 .format-radio:has(input:checked) {
@@ -436,7 +436,8 @@ input[type="range"] {
 }
 
 .format-radio:not(:has(input:checked)):hover {
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(120, 120, 120, 0.08);
+  color: var(--ink);
 }
 
 .format-radio:has(input:disabled) {
@@ -447,12 +448,12 @@ input[type="range"] {
 /* Select inputs */
 .select-input {
   width: 100%;
-  min-height: 40px;
+  min-height: 32px;
   border: 1px solid var(--btn-sec-border);
-  border-radius: 8px;
-  padding: 0 12px;
+  border-radius: 6px;
+  padding: 0 10px;
   background: var(--input-bg);
-  font-size: 0.9rem;
+  font-size: 0.8rem;
   font-weight: 600;
   cursor: pointer;
   outline: none;
@@ -460,23 +461,23 @@ input[type="range"] {
 
 .resize {
   display: grid;
-  gap: 16px;
-  padding: 16px;
+  gap: 12px;
+  padding: 12px;
   border: 1px solid var(--panel-border);
-  border-radius: 12px;
-  background: rgba(0, 0, 0, 0.1);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.03);
 }
 
 .resize-row {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 12px;
+  gap: 8px;
 }
 
 .field {
   display: grid;
-  gap: 6px;
-  font-size: 0.78rem;
+  gap: 4px;
+  font-size: 0.72rem;
   font-weight: 700;
   text-transform: uppercase;
   color: var(--muted);
@@ -485,10 +486,11 @@ input[type="range"] {
 
 .field input {
   width: 100%;
-  min-height: 40px;
+  min-height: 32px;
   border: 1px solid var(--btn-sec-border);
-  border-radius: 8px;
-  padding: 0 12px;
+  border-radius: 6px;
+  padding: 0 10px;
+  font-size: 0.8rem;
   font-weight: 600;
   color: var(--ink);
   background: var(--input-bg);
@@ -505,16 +507,16 @@ input[type="range"] {
 .controls {
   display: grid;
   grid-template-columns: 1.5fr 1fr;
-  gap: 12px;
-  padding: 20px;
+  gap: 8px;
+  padding: 14px;
   border-top: 1px solid var(--line);
 }
 
 .primary {
   background: var(--accent);
   color: #ffffff;
-  min-height: 46px;
-  font-size: 0.95rem;
+  min-height: 36px;
+  font-size: 0.85rem;
   font-weight: 700;
   box-shadow: 0 4px 12px var(--accent-glow);
 }
@@ -529,8 +531,8 @@ input[type="range"] {
   background: var(--btn-sec-bg);
   border: 1px solid var(--btn-sec-border);
   color: var(--ink);
-  min-height: 46px;
-  font-size: 0.9rem;
+  min-height: 36px;
+  font-size: 0.82rem;
 }
 
 .secondary:hover:not(:disabled) {
@@ -544,8 +546,8 @@ input[type="range"] {
   background: rgba(199, 53, 43, 0.06);
   color: var(--red);
   border: 1px solid rgba(199, 53, 43, 0.35);
-  min-height: 40px;
-  font-size: 0.85rem;
+  min-height: 32px;
+  font-size: 0.8rem;
   font-weight: 700;
 }
 
@@ -565,11 +567,11 @@ input[type="range"] {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   border-bottom: 1px solid var(--line);
-  background: rgba(0, 0, 0, 0.05);
+  background: rgba(120, 120, 120, 0.04);
 }
 
 .stat {
-  padding: 20px 16px;
+  padding: 10px 12px;
   border-right: 1px solid var(--line);
   text-align: center;
   display: flex;
@@ -584,16 +586,16 @@ input[type="range"] {
 .stat-value {
   display: block;
   font-family: 'Outfit', sans-serif;
-  font-size: 1.8rem;
+  font-size: 1.15rem;
   font-weight: 800;
   line-height: 1.1;
 }
 
 .stat-label {
   display: block;
-  margin-top: 6px;
+  margin-top: 3px;
   color: var(--muted);
-  font-size: 0.72rem;
+  font-size: 0.65rem;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.05em;
@@ -1835,4 +1837,92 @@ details.advanced-settings[open] summary::after {
 .crop-buttons button {
   padding: 9px 16px;
   font-size: 0.82rem;
+}
+
+/* Card Status and Action Styles */
+.image-card.status-done {
+  border-color: rgba(16, 185, 129, 0.25);
+  background: rgba(16, 185, 129, 0.01);
+}
+.image-card.status-done:hover {
+  border-color: #10b981;
+  box-shadow: 0 10px 20px rgba(16, 185, 129, 0.08);
+}
+
+.action-btn.convert-single-btn {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-glow);
+}
+.action-btn.convert-single-btn:hover {
+  background: var(--accent);
+  color: #ffffff;
+  box-shadow: 0 4px 10px var(--accent-glow);
+}
+
+.action-btn.dl-btn.downloaded {
+  border-color: rgba(16, 185, 129, 0.4);
+  background: rgba(16, 185, 129, 0.08);
+  color: #10b981;
+}
+.action-btn.dl-btn.downloaded:hover {
+  background: #10b981;
+  color: #ffffff;
+  box-shadow: 0 4px 10px rgba(16, 185, 129, 0.3);
+}
+
+/* ---------- Avertissement AVIF ---------- */
+.avif-hint {
+  margin-top: 6px;
+  color: var(--yellow);
+  font-weight: 600;
+}
+
+/* ---------- Zone de dépôt : focus clavier ---------- */
+.drop:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-color: var(--accent);
+}
+
+/* ---------- Notification éphémère (toast) ---------- */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translate(-50%, 16px);
+  z-index: 2000;
+  max-width: min(92vw, 480px);
+  padding: 12px 18px;
+  border-radius: 10px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.2);
+  color: var(--ink);
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-align: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s ease, transform 0.25s ease;
+}
+.toast.show {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+.toast.toast-warn {
+  border-color: rgba(148, 98, 0, 0.45);
+  color: var(--yellow);
+}
+
+/* ---------- Préférence « réduire les animations » ---------- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
 }
