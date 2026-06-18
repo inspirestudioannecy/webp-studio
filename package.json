@@ -1,0 +1,20 @@
+{
+  "name": "conversion-webp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Conversion rapide d'images en WebP qualite 80 pour sites web.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "convert": "node scripts/convert-to-webp.mjs",
+    "convert:overwrite": "node scripts/convert-to-webp.mjs --overwrite"
+  },
+  "dependencies": {
+    "sharp": "^0.35.1"
+  },
+  "devDependencies": {
+    "vite": "^5.2.11"
+  }
+}
