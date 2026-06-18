@@ -45,7 +45,6 @@ const elements = {
   cmpAfter: document.querySelector("#cmpAfter"),
   cmpBeforeWrap: document.querySelector("#cmpBeforeWrap"),
   cmpWipe: document.querySelector("#cmpWipe"),
-  cmpZoom: document.querySelector("#cmpZoom"),
   cmpZoomVal: document.querySelector("#cmpZoomVal"),
   cmpFit: document.querySelector("#cmpFit"),
   cmp100: document.querySelector("#cmp100"),
@@ -1052,13 +1051,12 @@ function applyGlobalPattern() {
 const compare = {
   open: false,
   item: null,
+  naturalW: 1,
+  naturalH: 1,
   fitScale: 1,
-  zoom: 1,
-  panX: 0,
-  panY: 0,
+  full: false, // false = ajusté à l'écran, true = 100% (pixels réels)
+  wipe: 50, // position du balayage en %
   dragging: false,
-  lastX: 0,
-  lastY: 0,
 };
 
 // Aperçu pleine résolution (HEIC décodé), partagé entre comparateur et recadrage.
@@ -1078,7 +1076,10 @@ async function openCompare(item) {
   if (!item || item.status !== "done") return;
   compare.item = item;
   compare.open = true;
+  compare.full = false;
+  compare.wipe = 50;
   compare.lastFocus = document.activeElement;
+  elements.cmpWipe.value = "50";
 
   await ensurePreviewUrl(item);
 
@@ -1113,46 +1114,29 @@ function layoutCompare() {
 
   compare.naturalW = naturalW;
   compare.naturalH = naturalH;
-  compare.fitScale = Math.min(vw / naturalW, vh / naturalH, 1);
-  elements.cmpZoom.value = "100";
-  compare.zoom = 1;
-  compare.panX = 0;
-  compare.panY = 0;
+  // Échelle « ajusté » : tient toujours dans le cadre, jamais agrandi au-delà du natif.
+  compare.fitScale = Math.min(vw / naturalW, vh / naturalH, 1) || 1;
   applyCompare();
 }
 
+// Modèle simple : l'étage est dimensionné en pixels, centré par margin:auto et
+// défilé nativement (overflow). Le balayage clippe l'original par-dessus.
 function applyCompare() {
-  const naturalW = compare.naturalW || 1;
-  const naturalH = compare.naturalH || 1;
-  const scale = compare.fitScale * compare.zoom;
-  const dispW = naturalW * scale;
-  const dispH = naturalH * scale;
-
-  // centre par défaut puis applique le pan, clampé
-  const vw = elements.cmpViewport.clientWidth;
-  const vh = elements.cmpViewport.clientHeight;
-  const baseX = (vw - dispW) / 2;
-  const baseY = (vh - dispH) / 2;
-
-  const minX = Math.min(baseX, vw - dispW);
-  const maxX = Math.max(baseX, 0);
-  const minY = Math.min(baseY, vh - dispH);
-  const maxY = Math.max(baseY, 0);
-  compare.panX = clamp(compare.panX || baseX, minX, maxX);
-  compare.panY = clamp(compare.panY || baseY, minY, maxY);
+  const scale = compare.full ? 1 : compare.fitScale || 1;
+  const dispW = Math.max(1, Math.round(compare.naturalW * scale));
+  const dispH = Math.max(1, Math.round(compare.naturalH * scale));
 
   elements.cmpStage.style.width = `${dispW}px`;
   elements.cmpStage.style.height = `${dispH}px`;
-  elements.cmpStage.style.transform = `translate(${compare.panX}px, ${compare.panY}px)`;
 
   for (const img of [elements.cmpAfter, elements.cmpBefore]) {
     img.style.width = `${dispW}px`;
     img.style.height = `${dispH}px`;
   }
 
-  const wipe = Number(elements.cmpWipe.value);
+  const wipe = clamp(compare.wipe, 0, 100);
   elements.cmpBeforeWrap.style.width = `${(wipe / 100) * dispW}px`;
-
+  elements.cmpWipe.value = String(Math.round(wipe));
   elements.cmpZoomVal.textContent = `${Math.round(scale * 100)}%`;
 }
 
@@ -1234,44 +1218,36 @@ elements.cmpQuality.addEventListener("input", () => {
   }, 150);
 });
 
-elements.cmpWipe.addEventListener("input", applyCompare);
-elements.cmpZoom.addEventListener("input", () => {
-  compare.zoom = Number(elements.cmpZoom.value) / 100;
+elements.cmpWipe.addEventListener("input", () => {
+  compare.wipe = Number(elements.cmpWipe.value);
   applyCompare();
 });
 elements.cmpFit.addEventListener("click", () => {
-  elements.cmpZoom.value = "100";
-  compare.zoom = 1;
-  compare.panX = null;
-  compare.panY = null;
+  compare.full = false;
   applyCompare();
 });
 elements.cmp100.addEventListener("click", () => {
-  const target = compare.fitScale > 0 ? 100 / compare.fitScale : 100;
-  const clamped = clamp(Math.round(target), 25, 400);
-  elements.cmpZoom.value = String(clamped);
-  compare.zoom = clamped / 100;
-  compare.panX = null;
-  compare.panY = null;
+  compare.full = true;
   applyCompare();
 });
 
+// Balayage direct : on glisse sur l'image pour déplacer la ligne avant/après.
+function setWipeFromEvent(event) {
+  const rect = elements.cmpStage.getBoundingClientRect();
+  if (rect.width <= 0) return;
+  compare.wipe = clamp(((event.clientX - rect.left) / rect.width) * 100, 0, 100);
+  applyCompare();
+}
 elements.cmpViewport.addEventListener("pointerdown", (event) => {
   compare.dragging = true;
-  compare.lastX = event.clientX;
-  compare.lastY = event.clientY;
   elements.cmpViewport.classList.add("panning");
   elements.cmpViewport.setPointerCapture(event.pointerId);
+  setWipeFromEvent(event);
 });
 elements.cmpViewport.addEventListener("pointermove", (event) => {
-  if (!compare.dragging) return;
-  compare.panX = (compare.panX || 0) + (event.clientX - compare.lastX);
-  compare.panY = (compare.panY || 0) + (event.clientY - compare.lastY);
-  compare.lastX = event.clientX;
-  compare.lastY = event.clientY;
-  applyCompare();
+  if (compare.dragging) setWipeFromEvent(event);
 });
-["pointerup", "pointercancel", "pointerleave"].forEach((name) => {
+["pointerup", "pointercancel"].forEach((name) => {
   elements.cmpViewport.addEventListener(name, () => {
     compare.dragging = false;
     elements.cmpViewport.classList.remove("panning");
@@ -1779,8 +1755,12 @@ function revokeZipUrl() {
 }
 
 function render() {
-  elements.emptyState.hidden = state.items.length > 0;
-  elements.tableWrap.hidden = state.items.length === 0;
+  const hasItems = state.items.length > 0;
+  elements.emptyState.hidden = hasItems;
+  elements.tableWrap.hidden = !hasItems;
+  // Dès qu'il y a des images, la zone de dépôt se réduit à une barre compacte
+  // (on peut toujours en ajouter) pour laisser la place aux cartes.
+  elements.dropZone.classList.toggle("is-compact", hasItems);
   // Reconversion autorisée : actif dès qu'il y a des images (changer un réglage
   // relancera tout ; sans changement et tout déjà fait, le clic est sans effet).
   elements.convertButton.disabled = state.isConverting || state.items.length === 0;

@@ -48,6 +48,10 @@
   box-sizing: border-box;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   min-height: 100vh;
@@ -215,6 +219,27 @@ select:focus-visible {
   border-color: var(--accent);
   background: var(--accent-glow);
   transform: scale(0.99);
+}
+
+/* Mode compact : une fois des images importées, la zone se réduit à une barre. */
+.drop.is-compact {
+  min-height: 0;
+  flex-direction: row;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px 14px;
+  padding: 12px 16px;
+}
+.drop.is-compact .drop-mark {
+  width: 34px;
+  height: 34px;
+  font-size: 1rem;
+}
+.drop.is-compact h2 {
+  font-size: 1rem;
+}
+.drop.is-compact p {
+  display: none;
 }
 
 .drop-mark {
@@ -991,9 +1016,10 @@ input[type="range"] {
 .cmp-viewport {
   position: relative;
   flex: 1;
-  overflow: hidden;
+  overflow: auto;
+  display: flex;
   background: repeating-conic-gradient(#edf0f5 0% 25%, #ffffff 0% 50%) 50% / 24px 24px;
-  cursor: grab;
+  cursor: ew-resize;
   user-select: none;
   touch-action: none;
 }
@@ -1002,15 +1028,20 @@ input[type="range"] {
 }
 
 .cmp-viewport.panning {
-  cursor: grabbing;
+  cursor: ew-resize;
 }
 
 .cmp-stage {
-  position: absolute;
-  top: 0;
-  left: 0;
-  transform-origin: top left;
-  will-change: transform;
+  position: relative;
+  margin: auto;
+  flex: none;
+}
+
+.cmp-zoomval {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.75;
+  min-width: 42px;
+  text-align: right;
 }
 
 .cmp-img {
