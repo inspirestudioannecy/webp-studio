@@ -1273,6 +1273,9 @@ details.advanced-settings[open] summary::after {
 }
 
 /* ---- Compare Spinner ---- */
+.cmp-spinner[hidden] {
+  display: none;
+}
 .cmp-spinner {
   position: absolute;
   inset: 0;
