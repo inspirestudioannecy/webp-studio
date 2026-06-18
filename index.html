@@ -4,8 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>WebP Studio — Inspire Conversion</title>
-    <script type="module" crossorigin src="./assets/index-zVogw0Wa.js"></script>
-    <link rel="stylesheet" crossorigin href="./assets/index-fdY4M5XP.css">
+    <script type="module" crossorigin src="./assets/index-i7AkT6GJ.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-C4za15ci.css">
   </head>
   <body>
     <div id="globalDropOverlay" class="global-drop-overlay" hidden>
@@ -159,8 +159,9 @@
                 <div class="setting-item">
                   <div class="setting-head"><span>Vitesse & Concurrence</span></div>
                   <select id="concurrencyInput" class="select-input">
+                    <option value="auto" selected>Auto (selon votre machine)</option>
                     <option value="1">1 image à la fois (Plus fluide)</option>
-                    <option value="2" selected>2 images en parallèle (Recommandé)</option>
+                    <option value="2">2 images en parallèle</option>
                     <option value="4">4 images en parallèle (Rapide)</option>
                     <option value="8">8 images en parallèle (Maximum)</option>
                   </select>
@@ -173,6 +174,10 @@
             <button id="convertButton" class="primary" disabled>
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
               <span>Convertir</span>
+            </button>
+            <button id="cancelButton" class="danger" style="display:none;">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+              <span>Annuler</span>
             </button>
             <button id="zipButton" class="secondary" disabled>
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
@@ -200,6 +205,11 @@
               <span id="outputSize" class="stat-value">0 B</span>
               <span class="stat-label">taille finale</span>
             </div>
+          </div>
+
+          <div id="progressWrap" class="progress-wrap" hidden>
+            <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
+            <span id="progressLabel" class="progress-label">0 %</span>
           </div>
 
           <div class="queue-head" style="display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%;">
@@ -250,7 +260,7 @@
     </main>
 
     <!-- Comparateur avant/après -->
-    <div id="compareModal" class="modal" hidden>
+    <div id="compareModal" class="modal" hidden role="dialog" aria-modal="true" aria-label="Comparaison avant / après">
       <div class="modal-card">
         <div class="modal-head">
           <h3 id="cmpTitle">Comparaison</h3>
@@ -290,6 +300,60 @@
           </div>
         </div>
         <div id="cmpMeta" class="cmp-meta"></div>
+      </div>
+    </div>
+
+    <!-- Recadrage / formats réseaux sociaux -->
+    <div id="cropModal" class="modal" hidden role="dialog" aria-modal="true" aria-label="Recadrer l'image">
+      <div class="modal-card crop-card">
+        <div class="modal-head">
+          <h3 id="cropTitle">Recadrer</h3>
+          <button id="cropClose" class="action-btn" title="Fermer" aria-label="Fermer">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <div id="cropViewport" class="crop-viewport">
+          <img id="cropImage" class="crop-image" alt="" />
+          <div id="cropRect" class="crop-rect" hidden>
+            <span class="crop-handle nw" data-handle="nw"></span>
+            <span class="crop-handle n" data-handle="n"></span>
+            <span class="crop-handle ne" data-handle="ne"></span>
+            <span class="crop-handle e" data-handle="e"></span>
+            <span class="crop-handle se" data-handle="se"></span>
+            <span class="crop-handle s" data-handle="s"></span>
+            <span class="crop-handle sw" data-handle="sw"></span>
+            <span class="crop-handle w" data-handle="w"></span>
+          </div>
+        </div>
+        <div class="crop-controls">
+          <div class="crop-ratios" id="cropRatios">
+            <button type="button" class="crop-ratio-btn active" data-ratio="free">Libre</button>
+            <button type="button" class="crop-ratio-btn" data-ratio="1">1:1</button>
+            <button type="button" class="crop-ratio-btn" data-ratio="0.8">4:5</button>
+            <button type="button" class="crop-ratio-btn" data-ratio="0.75">3:4</button>
+            <button type="button" class="crop-ratio-btn" data-ratio="1.7777778">16:9</button>
+            <button type="button" class="crop-ratio-btn" data-ratio="0.5625">9:16</button>
+          </div>
+          <label class="crop-preset-field">
+            <span>Format réseau social</span>
+            <select id="cropPreset" class="select-input">
+              <option value="">— Aucun (recadrage libre) —</option>
+              <option value="ig_post">Instagram — Post carré (1080×1080)</option>
+              <option value="ig_portrait">Instagram — Portrait (1080×1350)</option>
+              <option value="ig_story">Instagram / TikTok — Story (1080×1920)</option>
+              <option value="fb_link">Facebook — Lien (1200×630)</option>
+              <option value="li_post">LinkedIn — Post (1200×627)</option>
+              <option value="x_post">X / Twitter — Post (1600×900)</option>
+              <option value="yt_thumb">YouTube — Miniature (1280×720)</option>
+              <option value="pin">Pinterest — Épingle (1000×1500)</option>
+            </select>
+          </label>
+          <div class="crop-buttons">
+            <button id="cropReset" class="secondary" type="button">Réinitialiser</button>
+            <button id="cropApplyAll" class="secondary" type="button" title="Recadrage centré du même format sur toutes les images">Appliquer à tout le lot</button>
+            <button id="cropApply" class="primary" type="button">Appliquer</button>
+          </div>
+        </div>
       </div>
     </div>
 
