@@ -1,8 +1,12 @@
+import { WorkerPool } from "./worker-pool.js";
+
 const state = {
   items: [],
   isConverting: false,
   zipUrl: null,
-  loadingHeic: false,
+  renameBarOpen: false,
+  lastSignature: null,
+  abort: false,
 };
 
 const elements = {
@@ -17,12 +21,16 @@ const elements = {
   maxHeight: document.querySelector("#maxHeight"),
   noUpscale: document.querySelector("#noUpscale"),
   convertButton: document.querySelector("#convertButton"),
+  cancelButton: document.querySelector("#cancelButton"),
   zipButton: document.querySelector("#zipButton"),
   clearButton: document.querySelector("#clearButton"),
   totalCount: document.querySelector("#totalCount"),
   doneCount: document.querySelector("#doneCount"),
   gainValue: document.querySelector("#gainValue"),
   outputSize: document.querySelector("#outputSize"),
+  progressWrap: document.querySelector("#progressWrap"),
+  progressBar: document.querySelector("#progressBar"),
+  progressLabel: document.querySelector("#progressLabel"),
   queueHint: document.querySelector("#queueHint"),
   emptyState: document.querySelector("#emptyState"),
   tableWrap: document.querySelector("#tableWrap"),
@@ -87,54 +95,54 @@ themeToggle.addEventListener("click", () => {
 setTheme(getTheme());
 
 /* ---------- Support AVIF ---------- */
+// L'encodage AVIF passe par le codec WASM @jsquash : il fonctionne dans tous les
+// navigateurs modernes, indépendamment du support AVIF natif du <canvas>.
 const avifSupportBadge = document.getElementById("avifSupportBadge");
 const avifRadioLabel = document.getElementById("avifRadioLabel");
-const avifRadioInput = avifRadioLabel.querySelector("input");
 
 function checkAvifSupport() {
+  const supportsWasm =
+    typeof Worker !== "undefined" && typeof OffscreenCanvas !== "undefined";
+  if (supportsWasm) {
+    avifSupportBadge.textContent = "supporté";
+    avifSupportBadge.style.color = "var(--accent)";
+    avifRadioLabel.title = "Encodage AVIF de qualité via codec intégré (WASM).";
+    return;
+  }
+  // Très vieux navigateur sans worker : on tombe sur l'AVIF natif du canvas.
   const canvas = document.createElement("canvas");
   canvas.width = 1;
   canvas.height = 1;
   canvas.toBlob((blob) => {
-    const supported = blob && blob.type === "image/avif";
-    if (supported) {
+    if (blob && blob.type === "image/avif") {
       avifSupportBadge.textContent = "supporté";
       avifSupportBadge.style.color = "var(--accent)";
     } else {
       avifSupportBadge.textContent = "non supporté";
       avifSupportBadge.style.color = "var(--red)";
-      avifRadioInput.disabled = true;
-      avifRadioLabel.title = "L'encodage AVIF n'est pas supporté par votre navigateur (requis: Chrome 121+).";
+      avifRadioLabel.querySelector("input").disabled = true;
+      avifRadioLabel.title = "AVIF non supporté par ce navigateur.";
     }
   }, "image/avif");
 }
 checkAvifSupport();
 
 /* ---------- décodeur HEIC ---------- */
-async function loadHeic2Any() {
-  if (window.heic2any) return window.heic2any;
-  if (state.loadingHeic) {
-    while (state.loadingHeic) {
-      await new Promise(r => setTimeout(r, 100));
-    }
-    return window.heic2any;
+// heic2any est bundlé (npm) : fonctionne hors-ligne, chargé à la demande.
+// createImageBitmap ne sait pas lire le HEIC, on le pré-décode donc en PNG
+// (sans perte) sur le thread principal avant de l'envoyer au worker.
+let heicDecoder = null;
+
+async function decodeHeic(file) {
+  if (!heicDecoder) {
+    const module = await import("heic2any");
+    heicDecoder = module.default || module;
   }
-  state.loadingHeic = true;
-  try {
-    const script = document.createElement("script");
-    script.src = "https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js";
-    document.head.appendChild(script);
-    await new Promise((resolve, reject) => {
-      script.onload = resolve;
-      script.onerror = reject;
-    });
-  } catch (err) {
-    console.error("Impossible de charger le décodeur HEIC.", err);
-    throw new Error("Décodeur HEIC requis. Connectez-vous à internet pour le télécharger automatiquement.");
-  } finally {
-    state.loadingHeic = false;
-  }
-  return window.heic2any;
+  const decoded = await heicDecoder({
+    blob: file,
+    toType: "image/png",
+  });
+  return Array.isArray(decoded) ? decoded[0] : decoded;
 }
 
 /* ---------- réglages ---------- */
@@ -162,8 +170,30 @@ function readSettings() {
     maxHeight: Number.isFinite(maxH) && maxH > 0 ? maxH : null,
     noUpscale: elements.noUpscale.checked,
     format: formatInput ? formatInput.value : "image/webp",
-    concurrency: concurrencyInput ? parseInt(concurrencyInput.value, 10) : 2,
+    concurrency: concurrencyInput ? concurrencyInput.value : "auto",
   };
+}
+
+// « auto » = on s'adapte au nombre de cœurs logiques (borné pour rester sain).
+function resolveConcurrency(value) {
+  if (value === "auto" || value == null) {
+    return Math.max(2, Math.min(navigator.hardwareConcurrency || 4, 8));
+  }
+  const parsed = parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 2;
+}
+
+// Signature des réglages globaux : si elle change entre deux conversions, on
+// relance TOUT (les images déjà « done » sont remises en file).
+function settingsSignature(settings) {
+  return JSON.stringify([
+    settings.lossless,
+    settings.quality,
+    settings.maxWidth,
+    settings.maxHeight,
+    settings.noUpscale,
+    settings.format,
+  ]);
 }
 
 /* ---------- presets de compression ---------- */
@@ -282,6 +312,41 @@ elements.losslessInput.addEventListener("change", markCustomIfManual);
   applyPreset(saved && PRESETS[saved] ? saved : "standard");
 })();
 
+// Persiste/restaure le format de sortie et la concurrence.
+const concurrencyControl = document.getElementById("concurrencyInput");
+
+function saveExtraSettings() {
+  try {
+    const fmt = document.querySelector('input[name="outputFormat"]:checked');
+    if (fmt) localStorage.setItem("webp-format", fmt.value);
+    if (concurrencyControl) localStorage.setItem("webp-concurrency", concurrencyControl.value);
+  } catch {}
+}
+
+(() => {
+  try {
+    const fmt = localStorage.getItem("webp-format");
+    if (fmt) {
+      const radio = document.querySelector(
+        `input[name="outputFormat"][value="${fmt}"]`,
+      );
+      if (radio && !radio.disabled) radio.checked = true;
+    }
+    const conc = localStorage.getItem("webp-concurrency");
+    if (conc && concurrencyControl) {
+      const option = concurrencyControl.querySelector(`option[value="${conc}"]`);
+      if (option) concurrencyControl.value = conc;
+    }
+  } catch {}
+})();
+
+if (concurrencyControl) {
+  concurrencyControl.addEventListener("change", saveExtraSettings);
+}
+document.querySelectorAll('input[name="outputFormat"]').forEach((radio) => {
+  radio.addEventListener("change", saveExtraSettings);
+});
+
 /* ---------- renommage des fichiers de sortie ---------- */
 
 function getExtension(name) {
@@ -379,8 +444,23 @@ elements.folderInput.addEventListener("change", () => {
 });
 
 elements.convertButton.addEventListener("click", convertAll);
+elements.cancelButton.addEventListener("click", () => {
+  if (!state.isConverting) return;
+  state.abort = true;
+  elements.cancelButton.disabled = true;
+  const label = elements.cancelButton.querySelector("span");
+  if (label) label.textContent = "Annulation…";
+});
 elements.zipButton.addEventListener("click", downloadZip);
 elements.clearButton.addEventListener("click", clearQueue);
+
+const toggleRenameBarBtn = document.getElementById("toggleRenameBarBtn");
+if (toggleRenameBarBtn) {
+  toggleRenameBarBtn.addEventListener("click", () => {
+    state.renameBarOpen = !state.renameBarOpen;
+    render();
+  });
+}
 
 elements.dropZone.addEventListener("click", (event) => {
   if (!event.target.closest(".folder-link") && event.target !== elements.folderInput) {
@@ -495,6 +575,7 @@ function addFiles(files) {
       error: "",
       sujet: "",
       customNameOverride: false,
+      isEditingName: false,
     }))
     .filter((item) => isImageFile(item.file) || isHeicFile(item.file))
     .filter((item) => {
@@ -520,7 +601,7 @@ function removeFile(id) {
     const item = state.items[index];
     if (item.outputUrl) URL.revokeObjectURL(item.outputUrl);
     if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
-    if (item.tempPreviewUrl) URL.revokeObjectURL(item.tempPreviewUrl);
+    if (item.thumbUrl) URL.revokeObjectURL(item.thumbUrl);
     state.items.splice(index, 1);
     render();
   }
@@ -528,116 +609,242 @@ function removeFile(id) {
 
 /* ---------- conversion ---------- */
 
+// Pool de workers partagé (réutilisé entre la conversion par lot et la
+// recompression interactive du comparateur). Recréé si la concurrence change.
+let sharedPool = null;
+let sharedPoolSize = 0;
+const supportsWorkers =
+  typeof Worker !== "undefined" && typeof OffscreenCanvas !== "undefined";
+
+function getPool(concurrency) {
+  if (!supportsWorkers) return null;
+  if (sharedPool && sharedPoolSize === concurrency) return sharedPool;
+  if (sharedPool) sharedPool.terminate();
+  sharedPool = new WorkerPool(concurrency);
+  sharedPoolSize = concurrency;
+  return sharedPool;
+}
+
 async function convertAll() {
   if (state.isConverting) return;
-  state.isConverting = true;
-  revokeZipUrl();
 
   const settings = readSettings();
-  const concurrency = settings.concurrency || 2;
+  const signature = settingsSignature(settings);
 
-  render();
+  // Réglages globaux modifiés → on relance toutes les images.
+  if (signature !== state.lastSignature) {
+    for (const item of state.items) {
+      if (item.status === "done") item.status = "queued";
+    }
+  }
+  state.lastSignature = signature;
 
   const queue = state.items.filter((item) => item.status !== "done");
-  let activeCount = 0;
-  let index = 0;
-
-  const processNext = async () => {
-    if (index >= queue.length) return;
-    const item = queue[index++];
-    activeCount++;
-
-    item.status = "running";
-    item.error = "";
-    renderRow(item);
-    renderStats();
-
-    try {
-      const result = await convertToWebP(item.file, settings);
-      const ext = settings.format === "image/avif" ? "avif" : "webp";
-      item.outputName = item.outputName.replace(/\.[^.]+$/, `.${ext}`);
-      item.outputBlob = result.blob;
-      item.outputUrl = URL.createObjectURL(result.blob);
-      item.srcWidth = result.srcWidth;
-      item.srcHeight = result.srcHeight;
-      item.outWidth = result.outWidth;
-      item.outHeight = result.outHeight;
-      item.codec = result.codec;
-      item.status = "done";
-    } catch (error) {
-      item.status = "error";
-      item.error = error && error.message ? error.message : "Erreur lors de la conversion.";
-    }
-
-    renderRow(item);
-    renderStats();
-    activeCount--;
-
-    await processNext();
-  };
-
-  const promises = [];
-  for (let i = 0; i < Math.min(concurrency, queue.length); i++) {
-    promises.push(processNext());
+  if (queue.length === 0) {
+    render();
+    return;
   }
 
-  await Promise.all(promises);
+  state.isConverting = true;
+  state.abort = false;
+  revokeZipUrl();
+  render();
 
+  const concurrency = resolveConcurrency(settings.concurrency);
+  let index = 0;
+
+  const runner = async () => {
+    while (index < queue.length && !state.abort) {
+      const item = queue[index++];
+      await convertItem(item, settings);
+    }
+  };
+
+  const runners = [];
+  for (let i = 0; i < Math.min(concurrency, queue.length); i++) {
+    runners.push(runner());
+  }
+  await Promise.all(runners);
+
+  state.isConverting = false;
+  state.abort = false;
+  render();
+}
+
+async function convertItem(item, settings) {
+  if (state.abort) return;
+  item.status = "running";
+  item.error = "";
+  renderRow(item);
+  renderStats();
+
+  try {
+    const result = await convertOne(item.file, settings, item.crop);
+    if (state.abort) {
+      item.status = "queued";
+      renderRow(item);
+      return;
+    }
+    applyResult(item, result, settings);
+    item.status = "done";
+  } catch (error) {
+    if (state.abort) {
+      item.status = "queued";
+    } else {
+      item.status = "error";
+      item.error =
+        error && error.message ? error.message : "Erreur lors de la conversion.";
+    }
+  }
+
+  renderRow(item);
+  renderStats();
+}
+
+async function retryItem(item) {
+  if (state.isConverting) return;
+  state.isConverting = true;
+  state.abort = false;
+  render();
+  await convertItem(item, readSettings());
   state.isConverting = false;
   render();
 }
 
-async function convertToWebP(file, settings) {
-  let activeFile = file;
+function applyResult(item, result, settings) {
+  const ext = settings.format === "image/avif" ? "avif" : "webp";
+  item.outputName = item.outputName.replace(/\.[^.]+$/, `.${ext}`);
+  if (item.outputUrl) URL.revokeObjectURL(item.outputUrl);
+  item.outputBlob = result.blob;
+  item.outputUrl = URL.createObjectURL(result.blob);
+  item.srcWidth = result.srcWidth;
+  item.srcHeight = result.srcHeight;
+  item.outWidth = result.outWidth;
+  item.outHeight = result.outHeight;
+  item.codec = result.codec;
+  item.engine = result.engine;
+}
 
-  // Si fichier HEIC
+// Convertit un fichier : HEIC pré-décodé sur le thread principal, puis envoi au
+// worker (WASM). Repli sur le thread principal (canvas) si pas de worker, ou si
+// le worker échoue (ex. SVG décodé par <img>).
+async function convertOne(file, settings, crop) {
+  let blob = file;
   if (isHeicFile(file)) {
-    const heic2any = await loadHeic2Any();
-    const decodedBlob = await heic2any({
-      blob: file,
-      toType: "image/jpeg",
-      quality: 0.95
-    });
-    activeFile = Array.isArray(decodedBlob) ? decodedBlob[0] : decodedBlob;
+    blob = await decodeHeic(file);
   }
 
-  const bitmap = await loadBitmap(activeFile);
+  const pool = getPool(resolveConcurrency(settings.concurrency));
+  if (pool) {
+    try {
+      const result = await pool.run({ blob, settings, crop: crop || null });
+      return {
+        blob: new Blob([result.buffer], { type: result.mime }),
+        srcWidth: result.srcWidth,
+        srcHeight: result.srcHeight,
+        outWidth: result.outWidth,
+        outHeight: result.outHeight,
+        codec: result.codec,
+        engine: result.engine,
+      };
+    } catch (error) {
+      if (error && error.message === "Conversion annulée.") throw error;
+      // Repli : couvre les formats que le worker ne sait pas décoder (SVG…).
+      return convertOnMainThread(blob, settings, crop || null);
+    }
+  }
+
+  return convertOnMainThread(blob, settings, crop || null);
+}
+
+// Chemin de repli (navigateurs sans Worker/OffscreenCanvas) : canvas DOM.
+async function convertOnMainThread(blob, settings, crop) {
+  const bitmap = await loadBitmap(blob);
   const srcWidth = bitmap.width;
   const srcHeight = bitmap.height;
 
+  const region = computeRegion(crop, srcWidth, srcHeight);
   const { width, height } = targetDimensions(
-    srcWidth,
-    srcHeight,
+    region.sw,
+    region.sh,
     settings,
+    crop,
   );
 
-  const canvas = drawResized(bitmap, width, height);
+  const canvas = drawResized(
+    bitmap,
+    region.sx,
+    region.sy,
+    region.sw,
+    region.sh,
+    width,
+    height,
+  );
   if (typeof bitmap.close === "function") bitmap.close();
 
   const quality = settings.lossless ? 1 : settings.quality;
   const format = settings.format || "image/webp";
 
-  const blob = await new Promise((resolve) => {
+  const outBlob = await new Promise((resolve) => {
     canvas.toBlob(resolve, format, quality);
   });
 
-  if (!blob || (blob.type !== "image/webp" && blob.type !== "image/avif")) {
-    throw new Error(`Encodage en ${format.replace("image/", "").toUpperCase()} non supporté par ce navigateur.`);
+  if (!outBlob || (outBlob.type !== "image/webp" && outBlob.type !== "image/avif")) {
+    throw new Error(
+      `Encodage en ${format.replace("image/", "").toUpperCase()} non supporté par ce navigateur.`,
+    );
   }
 
-  const codec = format === "image/webp" ? await sniffWebpCodec(blob) : "avif";
+  const codec = format === "image/webp" ? await sniffWebpCodec(outBlob) : "avif";
 
   return {
-    blob,
+    blob: outBlob,
     srcWidth,
     srcHeight,
     outWidth: width,
     outHeight: height,
     codec,
+    engine: "canvas",
   };
 }
 
-function targetDimensions(width, height, settings) {
+// Région source à extraire (recadrage manuel explicite ou centré automatique).
+function computeRegion(crop, W, H) {
+  if (!crop) return { sx: 0, sy: 0, sw: W, sh: H };
+
+  if (crop.center && crop.aspect) {
+    const ratio = W / H;
+    let w;
+    let h;
+    if (crop.aspect >= ratio) {
+      w = 1;
+      h = ratio / crop.aspect;
+    } else {
+      h = 1;
+      w = crop.aspect / ratio;
+    }
+    const sw = Math.max(1, Math.round(w * W));
+    const sh = Math.max(1, Math.round(h * H));
+    return { sx: Math.round((W - sw) / 2), sy: Math.round((H - sh) / 2), sw, sh };
+  }
+
+  if (crop.w > 0 && crop.h > 0) {
+    return {
+      sx: Math.round(crop.x * W),
+      sy: Math.round(crop.y * H),
+      sw: Math.max(1, Math.round(crop.w * W)),
+      sh: Math.max(1, Math.round(crop.h * H)),
+    };
+  }
+
+  return { sx: 0, sy: 0, sw: W, sh: H };
+}
+
+function targetDimensions(width, height, settings, crop) {
+  if (crop && crop.outW && crop.outH) {
+    return { width: crop.outW, height: crop.outH };
+  }
+
   const ratios = [];
   if (settings.maxWidth) ratios.push(settings.maxWidth / width);
   if (settings.maxHeight) ratios.push(settings.maxHeight / height);
@@ -652,38 +859,38 @@ function targetDimensions(width, height, settings) {
   };
 }
 
-// Réduction par paliers (halving) pour garder de la netteté sur les
-// grosses réductions, sinon un seul drawImage adoucit trop.
-function drawResized(source, targetWidth, targetHeight) {
+// Réduction par paliers (halving) pour garder de la netteté sur les grosses
+// réductions. La région source (recadrage) est appliquée au premier drawImage.
+function drawResized(source, sx, sy, sw, sh, targetWidth, targetHeight) {
   let current = source;
-  let currentWidth = source.width;
-  let currentHeight = source.height;
+  let currentWidth = sw;
+  let currentHeight = sh;
+  let first = true;
 
-  while (
-    currentWidth > targetWidth * 2 &&
-    currentHeight > targetHeight * 2
-  ) {
+  while (currentWidth > targetWidth * 2 && currentHeight > targetHeight * 2) {
     const nextWidth = Math.max(targetWidth, Math.floor(currentWidth / 2));
-    const nextHeight = Math.max(
-      targetHeight,
-      Math.floor(currentHeight / 2),
-    );
-    current = paintStep(current, nextWidth, nextHeight);
+    const nextHeight = Math.max(targetHeight, Math.floor(currentHeight / 2));
+    current = first
+      ? paintStep(current, sx, sy, sw, sh, nextWidth, nextHeight)
+      : paintStep(current, 0, 0, currentWidth, currentHeight, nextWidth, nextHeight);
     currentWidth = nextWidth;
     currentHeight = nextHeight;
+    first = false;
   }
 
-  return paintStep(current, targetWidth, targetHeight);
+  return first
+    ? paintStep(current, sx, sy, sw, sh, targetWidth, targetHeight)
+    : paintStep(current, 0, 0, currentWidth, currentHeight, targetWidth, targetHeight);
 }
 
-function paintStep(source, width, height) {
+function paintStep(source, sx, sy, sw, sh, dw, dh) {
   const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
+  canvas.width = dw;
+  canvas.height = dh;
   const context = canvas.getContext("2d", { alpha: true });
   context.imageSmoothingEnabled = true;
   context.imageSmoothingQuality = "high";
-  context.drawImage(source, 0, 0, width, height);
+  context.drawImage(source, sx, sy, sw, sh, 0, 0, dw, dh);
   return canvas;
 }
 
@@ -847,14 +1054,26 @@ const compare = {
   lastY: 0,
 };
 
-function openCompare(item) {
+// Aperçu pleine résolution (HEIC décodé), partagé entre comparateur et recadrage.
+async function ensurePreviewUrl(item) {
+  if (item.previewUrl) return item.previewUrl;
+  try {
+    let blob = item.file;
+    if (isHeicFile(item.file)) blob = await decodeHeic(item.file);
+    item.previewUrl = URL.createObjectURL(blob);
+  } catch {
+    item.previewUrl = URL.createObjectURL(item.file);
+  }
+  return item.previewUrl;
+}
+
+async function openCompare(item) {
   if (!item || item.status !== "done") return;
   compare.item = item;
   compare.open = true;
+  compare.lastFocus = document.activeElement;
 
-  if (!item.previewUrl) {
-    item.previewUrl = URL.createObjectURL(item.file);
-  }
+  await ensurePreviewUrl(item);
 
   elements.cmpTitle.textContent = item.relativePath;
   elements.cmpAfter.src = item.outputUrl;
@@ -871,6 +1090,7 @@ function openCompare(item) {
   }
 
   elements.compareModal.hidden = false;
+  setTimeout(() => elements.cmpClose.focus(), 20);
 
   elements.cmpAfter.onload = layoutCompare;
   if (elements.cmpAfter.complete) layoutCompare();
@@ -957,6 +1177,9 @@ function closeCompare() {
   elements.compareModal.hidden = true;
   elements.cmpAfter.removeAttribute("src");
   elements.cmpBefore.removeAttribute("src");
+  if (compare.lastFocus && typeof compare.lastFocus.focus === "function") {
+    compare.lastFocus.focus();
+  }
 }
 
 elements.cmpClose.addEventListener("click", closeCompare);
@@ -986,19 +1209,10 @@ elements.cmpQuality.addEventListener("input", () => {
         ...currentSettings,
         quality: Number(qVal) / 100
       };
-      
-      const result = await convertToWebP(item.file, newSettings);
-      
-      if (item.outputUrl) URL.revokeObjectURL(item.outputUrl);
-      
-      item.outputBlob = result.blob;
-      item.outputUrl = URL.createObjectURL(result.blob);
-      item.srcWidth = result.srcWidth;
-      item.srcHeight = result.srcHeight;
-      item.outWidth = result.outWidth;
-      item.outHeight = result.outHeight;
-      item.codec = result.codec;
-      
+
+      const result = await convertOne(item.file, newSettings, item.crop);
+      applyResult(item, result, newSettings);
+
       elements.cmpAfter.src = item.outputUrl;
       elements.cmpMeta.innerHTML = compareMeta(item);
       
@@ -1058,6 +1272,340 @@ elements.cmpViewport.addEventListener("pointermove", (event) => {
 });
 window.addEventListener("resize", () => {
   if (compare.open) layoutCompare();
+});
+
+/* ---------- recadrage / formats réseaux sociaux ---------- */
+
+const SOCIAL_PRESETS = {
+  ig_post: { w: 1080, h: 1080 },
+  ig_portrait: { w: 1080, h: 1350 },
+  ig_story: { w: 1080, h: 1920 },
+  fb_link: { w: 1200, h: 630 },
+  li_post: { w: 1200, h: 627 },
+  x_post: { w: 1600, h: 900 },
+  yt_thumb: { w: 1280, h: 720 },
+  pin: { w: 1000, h: 1500 },
+};
+
+const cropEls = {
+  modal: document.getElementById("cropModal"),
+  title: document.getElementById("cropTitle"),
+  close: document.getElementById("cropClose"),
+  viewport: document.getElementById("cropViewport"),
+  image: document.getElementById("cropImage"),
+  rect: document.getElementById("cropRect"),
+  ratios: document.getElementById("cropRatios"),
+  preset: document.getElementById("cropPreset"),
+  reset: document.getElementById("cropReset"),
+  applyAll: document.getElementById("cropApplyAll"),
+  apply: document.getElementById("cropApply"),
+};
+
+const cropState = {
+  open: false,
+  item: null,
+  ratio: null, // aspect de sortie en px (largeur/hauteur), null = libre
+  preset: null, // {w,h} ou null
+  imgBox: { left: 0, top: 0, width: 1, height: 1 },
+  norm: { x: 0, y: 0, w: 1, h: 1 }, // rectangle normalisé (0..1 de l'image)
+  drag: null,
+  lastFocus: null,
+};
+
+async function openCrop(item) {
+  cropState.item = item;
+  cropState.open = true;
+  cropState.lastFocus = document.activeElement;
+  cropEls.title.textContent = `Recadrer — ${item.relativePath}`;
+
+  // Source d'aperçu (HEIC décodé si besoin), partagée avec le comparateur.
+  await ensurePreviewUrl(item);
+
+  // Restaure les réglages de recadrage existants
+  if (item.crop && item.crop.outW && item.crop.outH) {
+    cropState.preset = { w: item.crop.outW, h: item.crop.outH };
+    cropState.ratio = item.crop.outW / item.crop.outH;
+  } else if (item.crop && item.crop.w > 0) {
+    cropState.preset = null;
+    cropState.ratio = null;
+  } else {
+    cropState.preset = null;
+    cropState.ratio = null;
+  }
+  syncCropPresetSelect();
+  syncCropRatioButtons();
+
+  cropEls.modal.hidden = false;
+
+  cropEls.image.onload = () => {
+    computeCropImgBox();
+    // norm initial : crop explicite existant, sinon plein cadre (ajusté au ratio)
+    if (cropState.item.crop && cropState.item.crop.w > 0) {
+      cropState.norm = {
+        x: cropState.item.crop.x,
+        y: cropState.item.crop.y,
+        w: cropState.item.crop.w,
+        h: cropState.item.crop.h,
+      };
+    } else if (cropState.ratio) {
+      fitRatio(cropState.ratio);
+    } else {
+      cropState.norm = { x: 0, y: 0, w: 1, h: 1 };
+    }
+    layoutCropRect();
+    cropEls.rect.hidden = false;
+    updateApplyAllState();
+  };
+  cropEls.image.src = item.previewUrl;
+  if (cropEls.image.complete && cropEls.image.naturalWidth) cropEls.image.onload();
+
+  setTimeout(() => cropEls.close.focus(), 20);
+}
+
+function closeCrop() {
+  cropState.open = false;
+  cropState.item = null;
+  cropState.drag = null;
+  cropEls.modal.hidden = true;
+  cropEls.image.removeAttribute("src");
+  if (cropState.lastFocus && typeof cropState.lastFocus.focus === "function") {
+    cropState.lastFocus.focus();
+  }
+}
+
+function computeCropImgBox() {
+  const vp = cropEls.viewport.getBoundingClientRect();
+  const im = cropEls.image.getBoundingClientRect();
+  cropState.imgBox = {
+    left: im.left - vp.left,
+    top: im.top - vp.top,
+    width: im.width || 1,
+    height: im.height || 1,
+  };
+}
+
+// Place un rectangle de l'aspect demandé (px de sortie), centré et au max.
+function fitRatio(aspect) {
+  const r = cropState.imgBox.width / cropState.imgBox.height;
+  const k = aspect / r; // wn/hn
+  let wn;
+  let hn;
+  if (k >= 1) {
+    wn = 1;
+    hn = 1 / k;
+  } else {
+    hn = 1;
+    wn = k;
+  }
+  cropState.norm = { x: (1 - wn) / 2, y: (1 - hn) / 2, w: wn, h: hn };
+}
+
+function layoutCropRect() {
+  const box = cropState.imgBox;
+  const n = cropState.norm;
+  cropEls.rect.style.left = `${box.left + n.x * box.width}px`;
+  cropEls.rect.style.top = `${box.top + n.y * box.height}px`;
+  cropEls.rect.style.width = `${n.w * box.width}px`;
+  cropEls.rect.style.height = `${n.h * box.height}px`;
+}
+
+function syncCropPresetSelect() {
+  if (!cropState.preset) {
+    cropEls.preset.value = "";
+    return;
+  }
+  const match = Object.entries(SOCIAL_PRESETS).find(
+    ([, dims]) => dims.w === cropState.preset.w && dims.h === cropState.preset.h,
+  );
+  cropEls.preset.value = match ? match[0] : "";
+}
+
+function syncCropRatioButtons() {
+  const value = cropState.ratio == null ? "free" : String(cropState.ratio);
+  cropEls.ratios.querySelectorAll(".crop-ratio-btn").forEach((btn) => {
+    const active =
+      btn.dataset.ratio === "free"
+        ? cropState.ratio == null
+        : Math.abs(Number(btn.dataset.ratio) - (cropState.ratio || -1)) < 0.001;
+    btn.classList.toggle("active", active);
+  });
+}
+
+function updateApplyAllState() {
+  // Le recadrage de lot a besoin d'un ratio (impossible de centrer un crop libre).
+  cropEls.applyAll.disabled = cropState.ratio == null;
+  cropEls.applyAll.title = cropState.ratio == null
+    ? "Choisis un ratio ou un format réseau pour l'appliquer au lot"
+    : "Recadrage centré du même format sur toutes les images";
+}
+
+cropEls.ratios.addEventListener("click", (event) => {
+  const btn = event.target.closest(".crop-ratio-btn");
+  if (!btn) return;
+  if (btn.dataset.ratio === "free") {
+    cropState.ratio = null;
+    cropState.preset = null;
+  } else {
+    cropState.ratio = Number(btn.dataset.ratio);
+    cropState.preset = null;
+    fitRatio(cropState.ratio);
+    layoutCropRect();
+  }
+  syncCropPresetSelect();
+  syncCropRatioButtons();
+  updateApplyAllState();
+});
+
+cropEls.preset.addEventListener("change", () => {
+  const preset = SOCIAL_PRESETS[cropEls.preset.value];
+  if (preset) {
+    cropState.preset = { ...preset };
+    cropState.ratio = preset.w / preset.h;
+    fitRatio(cropState.ratio);
+    layoutCropRect();
+  } else {
+    cropState.preset = null;
+    cropState.ratio = null;
+  }
+  syncCropRatioButtons();
+  updateApplyAllState();
+});
+
+// Déplacement et redimensionnement du rectangle de recadrage.
+cropEls.rect.addEventListener("pointerdown", (event) => {
+  const handle = event.target.closest(".crop-handle");
+  cropState.drag = {
+    handle: handle ? handle.dataset.handle : "move",
+    startX: event.clientX,
+    startY: event.clientY,
+    startNorm: { ...cropState.norm },
+  };
+  cropEls.rect.setPointerCapture(event.pointerId);
+  event.preventDefault();
+  event.stopPropagation();
+});
+
+cropEls.rect.addEventListener("pointermove", (event) => {
+  if (!cropState.drag) return;
+  const box = cropState.imgBox;
+  const dxN = (event.clientX - cropState.drag.startX) / box.width;
+  const dyN = (event.clientY - cropState.drag.startY) / box.height;
+  if (cropState.drag.handle === "move") {
+    moveCropRect(dxN, dyN);
+  } else {
+    resizeCropRect(cropState.drag.handle, dxN, dyN);
+  }
+  layoutCropRect();
+});
+
+["pointerup", "pointercancel"].forEach((name) => {
+  cropEls.rect.addEventListener(name, () => {
+    cropState.drag = null;
+  });
+});
+
+function moveCropRect(dxN, dyN) {
+  const s = cropState.drag.startNorm;
+  let x = s.x + dxN;
+  let y = s.y + dyN;
+  x = clamp(x, 0, 1 - s.w);
+  y = clamp(y, 0, 1 - s.h);
+  cropState.norm = { x, y, w: s.w, h: s.h };
+}
+
+function resizeCropRect(handle, dxN, dyN) {
+  const s = cropState.drag.startNorm;
+  let left = s.x;
+  let top = s.y;
+  let right = s.x + s.w;
+  let bottom = s.y + s.h;
+  const min = 0.04;
+
+  if (handle.includes("w")) left = clamp(s.x + dxN, 0, right - min);
+  if (handle.includes("e")) right = clamp(right + dxN, left + min, 1);
+  if (handle.includes("n")) top = clamp(s.y + dyN, 0, bottom - min);
+  if (handle.includes("s")) bottom = clamp(bottom + dyN, top + min, 1);
+
+  let w = right - left;
+  let h = bottom - top;
+
+  if (cropState.ratio) {
+    const box = cropState.imgBox;
+    const aspectN = cropState.ratio * (box.height / box.width); // wn/hn
+    const horizontal = handle.includes("w") || handle.includes("e");
+    if (horizontal) {
+      h = w / aspectN;
+      if (handle.includes("n")) top = bottom - h;
+      else bottom = top + h;
+    } else {
+      w = h * aspectN;
+      if (handle.includes("w")) left = right - w;
+      else right = left + w;
+    }
+    // Si on déborde de l'image, on rétracte en gardant le ratio.
+    if (left < 0 || right > 1 || top < 0 || bottom > 1) {
+      return; // ignore ce mouvement plutôt que de casser le ratio
+    }
+  }
+
+  cropState.norm = { x: left, y: top, w: right - left, h: bottom - top };
+}
+
+cropEls.close.addEventListener("click", closeCrop);
+cropEls.modal.addEventListener("click", (event) => {
+  if (event.target === cropEls.modal) closeCrop();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && cropState.open) closeCrop();
+});
+window.addEventListener("resize", () => {
+  if (cropState.open) {
+    computeCropImgBox();
+    layoutCropRect();
+  }
+});
+
+cropEls.apply.addEventListener("click", () => {
+  const item = cropState.item;
+  if (!item) return;
+  const n = cropState.norm;
+  const crop = {
+    x: clamp(n.x, 0, 1),
+    y: clamp(n.y, 0, 1),
+    w: clamp(n.w, 0, 1),
+    h: clamp(n.h, 0, 1),
+  };
+  if (cropState.preset) {
+    crop.outW = cropState.preset.w;
+    crop.outH = cropState.preset.h;
+  }
+  item.crop = crop;
+  if (item.status === "done") item.status = "queued";
+  closeCrop();
+  render();
+});
+
+cropEls.applyAll.addEventListener("click", () => {
+  if (cropState.ratio == null) return;
+  const aspect = cropState.ratio;
+  const outW = cropState.preset ? cropState.preset.w : null;
+  const outH = cropState.preset ? cropState.preset.h : null;
+  for (const item of state.items) {
+    item.crop = { center: true, aspect, outW, outH };
+    if (item.status === "done") item.status = "queued";
+  }
+  closeCrop();
+  render();
+});
+
+cropEls.reset.addEventListener("click", () => {
+  const item = cropState.item;
+  if (item) {
+    item.crop = null;
+    if (item.status === "done") item.status = "queued";
+  }
+  closeCrop();
+  render();
 });
 
 /* ---------- ZIP ---------- */
@@ -1209,7 +1757,7 @@ function clearQueue() {
   for (const item of state.items) {
     if (item.outputUrl) URL.revokeObjectURL(item.outputUrl);
     if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
-    if (item.tempPreviewUrl) URL.revokeObjectURL(item.tempPreviewUrl);
+    if (item.thumbUrl) URL.revokeObjectURL(item.thumbUrl);
   }
   revokeZipUrl();
   state.items = [];
@@ -1226,10 +1774,16 @@ function revokeZipUrl() {
 function render() {
   elements.emptyState.hidden = state.items.length > 0;
   elements.tableWrap.hidden = state.items.length === 0;
-  elements.convertButton.disabled =
-    state.isConverting ||
-    state.items.length === 0 ||
-    state.items.every((item) => item.status === "done");
+  // Reconversion autorisée : actif dès qu'il y a des images (changer un réglage
+  // relancera tout ; sans changement et tout déjà fait, le clic est sans effet).
+  elements.convertButton.disabled = state.isConverting || state.items.length === 0;
+  elements.convertButton.style.display = state.isConverting ? "none" : "inline-flex";
+  elements.cancelButton.style.display = state.isConverting ? "inline-flex" : "none";
+  if (!state.isConverting) {
+    elements.cancelButton.disabled = false;
+    const label = elements.cancelButton.querySelector("span");
+    if (label) label.textContent = "Annuler";
+  }
   elements.zipButton.disabled =
     state.isConverting ||
     !state.items.some((item) => item.status === "done");
@@ -1240,8 +1794,20 @@ function render() {
       ? "Aucune image dans la file."
       : `${state.items.length} fichier(s) prêt(s).`;
 
-  document.getElementById("renameBar").hidden =
-    state.items.length === 0 || state.isConverting;
+  renderProgress();
+
+  const toggleRenameBtn = document.getElementById("toggleRenameBarBtn");
+  const renameBar = document.getElementById("renameBar");
+  if (toggleRenameBtn && renameBar) {
+    if (state.items.length === 0 || state.isConverting) {
+      toggleRenameBtn.style.display = "none";
+      renameBar.hidden = true;
+    } else {
+      toggleRenameBtn.style.display = "inline-flex";
+      renameBar.hidden = !state.renameBarOpen;
+      toggleRenameBtn.classList.toggle("active", state.renameBarOpen);
+    }
+  }
 
   renderRows();
   renderStats();
@@ -1270,30 +1836,55 @@ function renderRows() {
           </div>
         </div>
         <div class="card-info">
-          <div class="card-field-group">
-            <span class="card-field-label">Sujet de l'image</span>
-            <input class="card-sujet-input" type="text" placeholder="ex: portrait-equipe" title="Sujet inséré dans la trame" style="margin: 0;" />
+          <!-- Nom final avec bouton d'édition et badge de mode -->
+          <div class="card-final-name-row">
+            <div class="card-final-name-wrap" title="Double-cliquer pour renommer">
+              <span class="card-final-name"></span>
+              <button type="button" class="card-edit-btn" title="Renommer manuellement">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4z"/></svg>
+              </button>
+            </div>
+            <span class="card-rename-mode-badge auto">Auto</span>
           </div>
+
+          <!-- Zone d'édition manuelle masquée par défaut -->
+          <div class="card-edit-input-group">
+            <input class="card-name-input" type="text" placeholder="nom de sortie" title="Entrer le nouveau nom (sans extension)" />
+            <button type="button" class="card-rename-ok-btn" title="Confirmer">✓</button>
+            <button type="button" class="card-rename-reset-btn" title="Ré-appliquer la trame automatique">↺</button>
+          </div>
+
+          <!-- Nom d'origine (petit et discret) -->
           <div class="card-name" style="font-size: 0.68rem; color: var(--muted); margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="Chemin d'origine"></div>
-          <div class="card-field-group">
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-              <span class="card-field-label">Nom de sortie final</span>
-              <span class="card-rename-mode-badge auto">Auto</span>
-            </div>
-            <div style="display: flex; gap: 6px; align-items: center; width: 100%;">
-              <input class="card-name-input" type="text" placeholder="nom de sortie final" title="Renommer ce fichier final" style="flex: 1; margin: 0;" />
-              <button type="button" class="card-rename-reset-btn" title="Réinitialiser et ré-appliquer la trame automatique" style="display: none;">↺</button>
+
+          <!-- Sujet de l'image (s'affiche uniquement si la trame contient {sujet}) -->
+          <div class="card-sujet-group">
+            <div class="card-sujet-wrapper">
+              <span class="card-sujet-label">Sujet:</span>
+              <input class="card-sujet-input card-sujet-input-clean" type="text" placeholder="ex: portrait" title="Sujet inséré dans la trame" />
             </div>
           </div>
-          <div class="card-meta" style="margin-top: 6px;">
+
+          <!-- Métadonnées et dimensions -->
+          <div class="card-meta">
             <span class="size-before"></span>
             <span class="size-arrow" style="display:none;">→</span>
             <span class="size-after"></span>
             <span class="gain-badge" style="display:none;"></span>
           </div>
           <div class="card-dims"></div>
+
+          <!-- État d'erreur visible + bouton réessayer -->
+          <div class="card-error">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+            <span class="card-error-msg"></span>
+            <button type="button" class="card-retry-btn">Réessayer</button>
+          </div>
         </div>
         <div class="card-actions">
+          <button class="action-btn crop-btn" title="Recadrer / format réseaux sociaux">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/></svg>
+          </button>
           <button class="action-btn cmp-btn" style="display:none;" title="Comparer l'original et le compressé">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
             <span>Comparer</span>
@@ -1317,13 +1908,54 @@ function renderRows() {
   }
 }
 
+// Vignette légère (~256 px) au lieu de garder l'original pleine résolution en
+// mémoire : indispensable pour rester fluide sur de gros lots. Les HEIC gardent
+// le placeholder (pas de décodage coûteux juste pour un aperçu).
+async function ensureThumbnail(item, imgEl, placeholderEl) {
+  if (item.thumbUrl) {
+    imgEl.src = item.thumbUrl;
+    imgEl.style.display = "block";
+    if (placeholderEl) placeholderEl.style.display = "none";
+    return;
+  }
+  if (item.thumbPending || isHeicFile(item.file)) return;
+  item.thumbPending = true;
+  try {
+    const bitmap = await createImageBitmap(item.file);
+    const scale = Math.min(1, 256 / Math.max(bitmap.width, bitmap.height));
+    const w = Math.max(1, Math.round(bitmap.width * scale));
+    const h = Math.max(1, Math.round(bitmap.height * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    canvas.getContext("2d").drawImage(bitmap, 0, 0, w, h);
+    if (typeof bitmap.close === "function") bitmap.close();
+    const blob = await new Promise((resolve) =>
+      canvas.toBlob(resolve, "image/webp", 0.8),
+    );
+    item.thumbUrl = URL.createObjectURL(blob);
+    const liveCard = elements.queueBody.querySelector(`[data-id="${item.id}"]`);
+    if (liveCard) {
+      const liveImg = liveCard.querySelector(".card-preview");
+      const livePh = liveCard.querySelector(".card-preview-placeholder");
+      liveImg.src = item.thumbUrl;
+      liveImg.style.display = "block";
+      if (livePh) livePh.style.display = "none";
+    }
+  } catch {
+    // format non décodable (HEIC, SVG exotique…) → on garde le placeholder
+  } finally {
+    item.thumbPending = false;
+  }
+}
+
 function renderRow(item) {
   const card = elements.queueBody.querySelector(`[data-id="${item.id}"]`);
   if (!card) return;
 
   const nameEl = card.querySelector(".card-name");
-  nameEl.textContent = item.relativePath;
-  nameEl.title = item.relativePath;
+  nameEl.textContent = `Origine: ${item.relativePath}`;
+  nameEl.title = `Origine: ${item.relativePath}`;
 
   card.querySelector(".size-before").textContent = formatBytes(item.file.size);
   const dimsEl = card.querySelector(".card-dims");
@@ -1333,12 +1965,8 @@ function renderRow(item) {
 
   const imgEl = card.querySelector(".card-preview");
   const placeholderEl = card.querySelector(".card-preview-placeholder");
-  if (!imgEl.src && item.file) {
-    const previewUrl = URL.createObjectURL(item.file);
-    imgEl.src = previewUrl;
-    imgEl.style.display = "block";
-    if (placeholderEl) placeholderEl.style.display = "none";
-    item.tempPreviewUrl = previewUrl;
+  if (!imgEl.src) {
+    ensureThumbnail(item, imgEl, placeholderEl);
   }
 
   const statusEl = card.querySelector(".card-status-badge");
@@ -1347,6 +1975,23 @@ function renderRow(item) {
   if (item.error) {
     statusEl.title = item.error;
   }
+
+  // Erreur visible + bouton réessayer
+  const errorEl = card.querySelector(".card-error");
+  if (item.status === "error" && item.error) {
+    errorEl.classList.add("visible");
+    card.querySelector(".card-error-msg").textContent = item.error;
+    const retryBtn = card.querySelector(".card-retry-btn");
+    retryBtn.onclick = () => retryItem(item);
+  } else {
+    errorEl.classList.remove("visible");
+  }
+
+  // Bouton recadrer (toujours disponible) + repère « recadré »
+  const cropBtn = card.querySelector(".crop-btn");
+  cropBtn.onclick = () => openCrop(item);
+  cropBtn.classList.toggle("active", !!item.crop);
+  cropBtn.title = item.crop ? "Recadrage actif — modifier" : "Recadrer / format réseaux sociaux";
 
   const codecEl = card.querySelector(".card-codec-badge");
   if (item.codec) {
@@ -1362,11 +2007,64 @@ function renderRow(item) {
   const gainEl = card.querySelector(".gain-badge");
   const cmpBtn = card.querySelector(".cmp-btn");
   const dlBtn = card.querySelector(".dl-btn");
-  const nameInput = card.querySelector(".card-name-input");
-  const sujetInput = card.querySelector(".card-sujet-input");
 
-  const modeBadge = card.querySelector(".card-rename-mode-badge");
+  const finalNameEl = card.querySelector(".card-final-name");
+  finalNameEl.textContent = item.outputName;
+  finalNameEl.title = item.outputName;
+
+  const finalNameRow = card.querySelector(".card-final-name-row");
+  const editInputGroup = card.querySelector(".card-edit-input-group");
+  const nameInput = card.querySelector(".card-name-input");
+  const editBtn = card.querySelector(".card-edit-btn");
+  const finalNameWrap = card.querySelector(".card-final-name-wrap");
+  const okBtn = card.querySelector(".card-rename-ok-btn");
   const resetBtn = card.querySelector(".card-rename-reset-btn");
+  const modeBadge = card.querySelector(".card-rename-mode-badge");
+
+  if (item.isEditingName) {
+    if (finalNameRow) finalNameRow.style.display = "none";
+    if (editInputGroup) editInputGroup.style.display = "flex";
+    if (nameInput) {
+      if (document.activeElement !== nameInput) {
+        const ext = getExtension(item.outputName);
+        nameInput.value = item.outputName.endsWith("." + ext) ? item.outputName.slice(0, -(ext.length + 1)) : item.outputName;
+      }
+      setTimeout(() => nameInput.focus(), 10);
+    }
+  } else {
+    if (finalNameRow) finalNameRow.style.display = "flex";
+    if (editInputGroup) editInputGroup.style.display = "none";
+  }
+
+  const startEdit = () => {
+    item.isEditingName = true;
+    renderRow(item);
+  };
+  
+  if (editBtn) editBtn.onclick = (e) => { e.stopPropagation(); startEdit(); };
+  if (finalNameWrap) finalNameWrap.ondblclick = startEdit;
+
+  const saveEdit = () => {
+    if (nameInput) {
+      commitRename(item, nameInput.value, nameInput);
+    }
+    item.isEditingName = false;
+    renderRow(item);
+  };
+
+  if (okBtn) okBtn.onclick = (e) => { e.stopPropagation(); saveEdit(); };
+  if (nameInput) {
+    nameInput.onkeydown = (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        saveEdit();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        item.isEditingName = false;
+        renderRow(item);
+      }
+    };
+  }
 
   if (item.customNameOverride) {
     if (modeBadge) {
@@ -1375,8 +2073,10 @@ function renderRow(item) {
     }
     if (resetBtn) {
       resetBtn.style.display = "grid";
-      resetBtn.onclick = () => {
+      resetBtn.onclick = (e) => {
+        e.stopPropagation();
         item.customNameOverride = false;
+        item.isEditingName = false;
         updateOutputNameFromPattern(item);
         enforceUniqueNames();
         applyGlobalPattern();
@@ -1392,6 +2092,17 @@ function renderRow(item) {
     }
   }
 
+  // Handle conditional display of sujet-group based on pattern containing {sujet}
+  const patternInput = document.getElementById("renamePattern");
+  const pattern = patternInput ? patternInput.value : "";
+  const hasSujet = pattern.includes("{sujet}");
+  const sujetGroup = card.querySelector(".card-sujet-group");
+  const sujetInput = card.querySelector(".card-sujet-input");
+
+  if (sujetGroup) {
+    sujetGroup.style.display = hasSujet ? "block" : "none";
+  }
+
   if (sujetInput) {
     if (document.activeElement !== sujetInput) sujetInput.value = item.sujet || "";
     sujetInput.oninput = () => {
@@ -1399,22 +2110,18 @@ function renderRow(item) {
       updateOutputNameFromPattern(item);
       enforceUniqueNames();
       
-      // Update outputName input value on all cards to reflect index and deduplication changes
+      // Update outputName value on all cards to reflect index and deduplication changes
       state.items.forEach(other => {
         const otherCard = elements.queueBody.querySelector(`[data-id="${other.id}"]`);
         if (otherCard) {
-          const otherInput = otherCard.querySelector(".card-name-input");
-          if (otherInput && document.activeElement !== otherInput) {
-            otherInput.value = other.outputName;
+          const otherFinalName = otherCard.querySelector(".card-final-name");
+          if (otherFinalName && !other.isEditingName) {
+            otherFinalName.textContent = other.outputName;
           }
-          const otherResetBtn = otherCard.querySelector(".card-rename-reset-btn");
           const otherBadge = otherCard.querySelector(".card-rename-mode-badge");
           if (otherBadge) {
             otherBadge.textContent = other.customNameOverride ? "Manuel" : "Auto";
             otherBadge.className = `card-rename-mode-badge ${other.customNameOverride ? "manual" : "auto"}`;
-          }
-          if (otherResetBtn) {
-            otherResetBtn.style.display = other.customNameOverride ? "grid" : "none";
           }
         }
       });
@@ -1445,11 +2152,6 @@ function renderRow(item) {
     dlBtn.style.display = "none";
   }
 
-  // Affiche toujours le nom de sortie estimé, éditable à la main
-  nameInput.style.display = "block";
-  if (document.activeElement !== nameInput) nameInput.value = item.outputName;
-  nameInput.onchange = () => commitRename(item, nameInput.value, nameInput);
-
   const delBtn = card.querySelector(".del-btn");
   delBtn.onclick = () => removeFile(item.id);
 }
@@ -1478,18 +2180,27 @@ function renderStats() {
   }
   
   elements.outputSize.textContent = formatBytes(outputTotal);
+  renderProgress();
+}
+
+function renderProgress() {
+  if (!state.isConverting) {
+    elements.progressWrap.hidden = true;
+    return;
+  }
+  const total = state.items.length || 1;
+  const processed = state.items.filter(
+    (item) => item.status === "done" || item.status === "error",
+  ).length;
+  const percent = Math.round((processed / total) * 100);
+  elements.progressWrap.hidden = false;
+  elements.progressBar.style.width = `${percent}%`;
+  elements.progressLabel.textContent = `${processed}/${total} · ${percent} %`;
 }
 
 function percentGain(input, output) {
   if (!input) return 0;
   return Math.round((1 - output / input) * 100);
-}
-
-function statusClass(status) {
-  if (status === "done") return "done";
-  if (status === "error") return "error";
-  if (status === "running") return "running";
-  return "";
 }
 
 function statusLabel(status) {
@@ -1518,10 +2229,6 @@ function formatBytes(bytes) {
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
-}
-
-function waitFrame() {
-  return new Promise((resolve) => requestAnimationFrame(resolve));
 }
 
 render();

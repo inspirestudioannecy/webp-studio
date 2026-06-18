@@ -9,12 +9,17 @@
     "build": "vite build",
     "preview": "vite preview",
     "convert": "node scripts/convert-to-webp.mjs",
-    "convert:overwrite": "node scripts/convert-to-webp.mjs --overwrite"
+    "convert:overwrite": "node scripts/convert-to-webp.mjs --overwrite",
+    "deploy": "vite build && gh-pages -d dist"
   },
   "dependencies": {
+    "@jsquash/avif": "^2.1.1",
+    "@jsquash/webp": "^1.5.0",
+    "heic2any": "^0.0.4",
     "sharp": "^0.35.1"
   },
   "devDependencies": {
+    "gh-pages": "^6.1.1",
     "vite": "^5.2.11"
   }
 }
